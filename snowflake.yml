@@ -1,0 +1,13 @@
+# Snowflake configuration file
+# This file defines your Snowflake project structure and deployment settings
+
+definition_version: 2
+
+entities:
+  streamlit_app:
+    type: streamlit
+    stage: STREAMLIT_STAGE  # Will be created automatically if doesn't exist
+    main_file: streamlit_app.py
+    query_warehouse: COMPUTE_WH
+    artifacts:
+      - environment.yml

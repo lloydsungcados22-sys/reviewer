@@ -1,0 +1,12 @@
+# Environment configuration for Streamlit in Snowflake
+# This file specifies Python packages and dependencies
+
+name: streamlit_env
+channels:
+  - https://repo.anaconda.com/pkgs/snowflake
+  - nodefaults
+  - snowflake
+dependencies:
+  - streamlit
+  - pandas
+  - snowflake-snowpark-python
