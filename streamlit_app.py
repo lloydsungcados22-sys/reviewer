@@ -59,6 +59,13 @@ try:
 except ImportError:
     LLM_AVAILABLE = False
 
+# ReportLab for PDF export (optional)
+try:
+    import reportlab
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -1244,8 +1251,11 @@ def get_openai_temperature() -> float:
 # EXPORT FUNCTIONS
 # ============================================================================
 
-def export_to_pdf(questions: List[Dict], exam_title: str = "Criminology Practice Exam") -> bytes:
+def export_to_pdf(questions: List[Dict], exam_title: str = "Criminology Practice Exam") -> Optional[bytes]:
     """Export questions to PDF format"""
+    if not REPORTLAB_AVAILABLE:
+        return None
+    
     try:
         from reportlab.lib.pagesizes import letter
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -1305,16 +1315,13 @@ def export_to_pdf(questions: List[Dict], exam_title: str = "Criminology Practice
         buffer.seek(0)
         return buffer.getvalue()
     except ImportError:
-        st.error("PDF export requires reportlab. Install with: pip install reportlab")
         return None
     except Exception as e:
-        st.error(f"Error generating PDF: {str(e)}")
         return None
 
-def export_to_docx(questions: List[Dict], exam_title: str = "Criminology Practice Exam") -> bytes:
+def export_to_docx(questions: List[Dict], exam_title: str = "Criminology Practice Exam") -> Optional[bytes]:
     """Export questions to DOCX format"""
     if not DOCX_AVAILABLE or Document_class is None:
-        st.error("DOCX export requires python-docx. Install with: pip install python-docx")
         return None
     
     try:
@@ -2752,27 +2759,44 @@ elif page == "🧠 Practice Exam":
             with col1:
                 exam_title = st.text_input("Exam Title", value=f"Criminology Practice Exam - {datetime.now().strftime('%Y-%m-%d')}")
             
-            col1, col2 = st.columns(2)
-            with col1:
-                pdf_data = export_to_pdf(questions, exam_title)
-                if pdf_data:
-                    st.download_button(
-                        "📄 Download as PDF",
-                        data=pdf_data,
-                        file_name=f"{exam_title.replace(' ', '_')}.pdf",
-                        mime="application/pdf",
-                        use_container_width=True
-                    )
-            with col2:
-                docx_data = export_to_docx(questions, exam_title)
-                if docx_data:
-                    st.download_button(
-                        "📝 Download as DOCX",
-                        data=docx_data,
-                        file_name=f"{exam_title.replace(' ', '_')}.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        use_container_width=True
-                    )
+            # Only show export buttons if libraries are available
+            export_cols = []
+            if REPORTLAB_AVAILABLE:
+                export_cols.append(1)
+            if DOCX_AVAILABLE:
+                export_cols.append(2)
+            
+            if export_cols:
+                cols = st.columns(len(export_cols))
+                col_idx = 0
+                
+                if REPORTLAB_AVAILABLE:
+                    with cols[col_idx]:
+                        pdf_data = export_to_pdf(questions, exam_title)
+                        if pdf_data:
+                            st.download_button(
+                                "📄 Download as PDF",
+                                data=pdf_data,
+                                file_name=f"{exam_title.replace(' ', '_')}.pdf",
+                                mime="application/pdf",
+                                use_container_width=True
+                            )
+                    col_idx += 1
+                
+                if DOCX_AVAILABLE:
+                    with cols[col_idx] if len(export_cols) > 1 else st.container():
+                        docx_data = export_to_docx(questions, exam_title)
+                        if docx_data:
+                            st.download_button(
+                                "📝 Download as DOCX",
+                                data=docx_data,
+                                file_name=f"{exam_title.replace(' ', '_')}.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                use_container_width=True
+                            )
+            else:
+                # Only show info message if no export options are available
+                st.info("💡 Export functionality requires additional libraries. For local development, install with: `pip install reportlab python-docx`")
             
             # Regenerate button
             st.markdown("---")
