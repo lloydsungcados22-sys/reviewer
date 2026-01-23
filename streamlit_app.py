@@ -482,7 +482,7 @@ def generate_questions_llm(text: str, difficulty: str, num_questions: int, quest
         else:
             type_instruction = ", ".join(question_types)
         
-        prompt = f"""You are generating questions for the Philippine National Police (PNP) Criminology Licensure Examination. Generate {num_questions} {difficulty} level questions in proper PNP exam format based EXCLUSIVELY on the following review material from the document library.
+        prompt = f"""You are generating questions for the Philippine National Police (PNP) Criminology Licensure Examination. Generate EXACTLY {num_questions} {difficulty} level questions in proper PNP exam format based EXCLUSIVELY on the following review material from the document library. DO NOT generate more than {num_questions} questions.
 
 CRITICAL: ALL questions MUST be based ONLY on the provided review material. Do NOT use general knowledge or information not found in the material below.
 
@@ -540,7 +540,7 @@ VALIDATION CHECKLIST - Verify each question before including:
 ✓ Does the correct_answer match one of the options exactly?
 ✓ If any question fails these checks, DO NOT include it - regenerate or exclude it.
 
-Return ONLY a valid JSON array of question objects. Do not include any markdown formatting, code blocks, or explanations outside the JSON.
+Return ONLY a valid JSON array with EXACTLY {num_questions} question objects. Do not include any markdown formatting, code blocks, or explanations outside the JSON. IMPORTANT: The array must contain exactly {num_questions} questions, no more, no less.
 """
         
         if progress_callback:
@@ -581,6 +581,9 @@ Return ONLY a valid JSON array of question objects. Do not include any markdown 
             questions = json.loads(content)
             if not isinstance(questions, list):
                 questions = [questions]
+            
+            # Immediately limit to requested number before validation
+            questions = questions[:num_questions]
             
             # Ensure all questions have required fields and validate format
             validated_questions = []
@@ -661,7 +664,7 @@ Return ONLY a valid JSON array of question objects. Do not include any markdown 
                 st.warning(f"⚠️ First AI attempt generated {len(questions)} questions but all were rejected due to generic options or validation failures.")
                 st.info("💡 Retrying with stricter prompt...")
                 # Retry with an even more explicit prompt
-                retry_prompt = f"""Generate {num_questions} {difficulty} level PNP Criminology exam questions based on this material:
+                retry_prompt = f"""Generate EXACTLY {num_questions} {difficulty} level PNP Criminology exam questions based on this material. DO NOT generate more than {num_questions} questions:
 
 {text[:3000]}
 
@@ -680,7 +683,7 @@ CORRECT EXAMPLE:
   "explanation": "Securing the perimeter is the first priority to preserve evidence integrity."
 }}
 
-Return ONLY a JSON array. Each option must be a real answer, not a placeholder.
+Return ONLY a JSON array with EXACTLY {num_questions} questions. Each option must be a real answer, not a placeholder. DO NOT generate more than {num_questions} questions.
 """
                 try:
                     retry_response = client.chat.completions.create(
@@ -698,6 +701,9 @@ Return ONLY a JSON array. Each option must be a real answer, not a placeholder.
                     retry_questions = json.loads(retry_content)
                     if not isinstance(retry_questions, list):
                         retry_questions = [retry_questions]
+                    
+                    # Immediately limit to requested number before validation
+                    retry_questions = retry_questions[:num_questions]
                     
                     # Validate retry questions with same strict rules
                     validated_retry = []
@@ -748,9 +754,11 @@ Return ONLY a JSON array. Each option must be a real answer, not a placeholder.
                     
                     if validated_retry:
                         validated_retry = deduplicate_questions(validated_retry)
+                        # Strictly limit to requested number
+                        validated_retry = validated_retry[:num_questions]
                         if progress_callback:
                             progress_callback(f"✅ Generated {len(validated_retry)} valid questions on retry!")
-                        return validated_retry[:num_questions]
+                        return validated_retry
                     else:
                         if progress_callback:
                             progress_callback("❌ Retry also produced invalid questions. Falling back to rule-based...")
@@ -1043,6 +1051,8 @@ def generate_questions(text: str, difficulty: str, num_questions: int, question_
             llm_questions = generate_questions_llm(text, difficulty, num_questions, question_types, progress_callback)
             
             if llm_questions and len(llm_questions) > 0:
+                # Strictly limit to requested number
+                llm_questions = llm_questions[:num_questions]
                 if progress_callback:
                     progress_callback(f"✅ Generated {len(llm_questions)} AI-powered questions from your documents!")
                 st.success(f"✅ Successfully generated {len(llm_questions)} AI questions from your documents!")
@@ -1252,8 +1262,11 @@ def get_openai_temperature() -> float:
 # ============================================================================
 
 def export_to_pdf(questions: List[Dict], exam_title: str = "Criminology Practice Exam") -> Optional[bytes]:
-    """Export questions to PDF format"""
+    """Export questions to PDF format - silently returns None if unavailable"""
     if not REPORTLAB_AVAILABLE:
+        return None
+    
+    if not questions or len(questions) == 0:
         return None
     
     try:
@@ -1320,8 +1333,11 @@ def export_to_pdf(questions: List[Dict], exam_title: str = "Criminology Practice
         return None
 
 def export_to_docx(questions: List[Dict], exam_title: str = "Criminology Practice Exam") -> Optional[bytes]:
-    """Export questions to DOCX format"""
+    """Export questions to DOCX format - silently returns None if unavailable"""
     if not DOCX_AVAILABLE or Document_class is None:
+        return None
+    
+    if not questions or len(questions) == 0:
         return None
     
     try:
@@ -1361,7 +1377,6 @@ def export_to_docx(questions: List[Dict], exam_title: str = "Criminology Practic
         buffer.seek(0)
         return buffer.getvalue()
     except Exception as e:
-        st.error(f"Error generating DOCX: {str(e)}")
         return None
 
 # ============================================================================
@@ -2513,6 +2528,8 @@ elif page == "🧠 Practice Exam":
                         st.error("Question generation returned None. This is a bug - please report this error.")
                     elif isinstance(questions, list):
                         if len(questions) > 0:
+                            # Strictly limit to requested number
+                            questions = questions[:num_questions]
                             update_progress(f"✅ Successfully generated {len(questions)} questions!")
                             # Store questions in session state
                             st.session_state.current_questions = questions
@@ -2772,28 +2789,36 @@ elif page == "🧠 Practice Exam":
                 
                 if REPORTLAB_AVAILABLE:
                     with cols[col_idx]:
-                        pdf_data = export_to_pdf(questions, exam_title)
-                        if pdf_data:
-                            st.download_button(
-                                "📄 Download as PDF",
-                                data=pdf_data,
-                                file_name=f"{exam_title.replace(' ', '_')}.pdf",
-                                mime="application/pdf",
-                                use_container_width=True
-                            )
+                        try:
+                            pdf_data = export_to_pdf(questions, exam_title)
+                            if pdf_data:
+                                st.download_button(
+                                    "📄 Download as PDF",
+                                    data=pdf_data,
+                                    file_name=f"{exam_title.replace(' ', '_')}.pdf",
+                                    mime="application/pdf",
+                                    use_container_width=True
+                                )
+                        except Exception:
+                            # Silently fail - don't show error to user
+                            pass
                     col_idx += 1
                 
                 if DOCX_AVAILABLE:
                     with cols[col_idx] if len(export_cols) > 1 else st.container():
-                        docx_data = export_to_docx(questions, exam_title)
-                        if docx_data:
-                            st.download_button(
-                                "📝 Download as DOCX",
-                                data=docx_data,
-                                file_name=f"{exam_title.replace(' ', '_')}.docx",
-                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                use_container_width=True
-                            )
+                        try:
+                            docx_data = export_to_docx(questions, exam_title)
+                            if docx_data:
+                                st.download_button(
+                                    "📝 Download as DOCX",
+                                    data=docx_data,
+                                    file_name=f"{exam_title.replace(' ', '_')}.docx",
+                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                    use_container_width=True
+                                )
+                        except Exception:
+                            # Silently fail - don't show error to user
+                            pass
             else:
                 # Only show info message if no export options are available
                 st.info("💡 Export functionality requires additional libraries. For local development, install with: `pip install reportlab python-docx`")
