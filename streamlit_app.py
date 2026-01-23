@@ -2616,46 +2616,37 @@ elif page == "🧠 Practice Exam":
                 # Don't show answer options when paused
                 answer = None
             else:
-                # Answer options
-                if q['type'] == "MCQ":
-                    if not q.get('options') or len(q['options']) < 4:
-                        st.error("⚠️ This question has incomplete options. Please contact support.")
-                        st.stop()
-                    
-                    # Validate options are not generic
-                    has_generic = False
-                    for opt in q['options']:
-                        opt_lower = opt.lower().strip()
-                        if (len(opt_lower.split()) <= 2 and any(p in opt_lower for p in ['option a', 'option b', 'option c', 'option d'])) or \
-                           opt_lower in ['a', 'b', 'c', 'd', 'a.', 'b.', 'c.', 'd.'] or \
-                           ('option' in opt_lower and len(opt_lower.split()) <= 3):
-                            has_generic = True
-                            break
-                    
-                    if has_generic:
-                        st.error("⚠️ This question has generic options. Regenerating...")
-                        # Clear this question and regenerate
-                        st.session_state.current_questions = []
-                        st.session_state.current_question_index = 0
-                        st.rerun()
-                    
-                    # Format options with A, B, C, D labels
-                    formatted_options = [f"{chr(65+i)}. {opt}" for i, opt in enumerate(q['options'])]
-                    answer_idx = st.radio("Select your answer:", formatted_options, key=f"q_{current_idx}")
-                    # Extract the actual answer text
-                    answer = q['options'][formatted_options.index(answer_idx)]
-                # All questions are now Multiple Choice only
-                # Convert any non-MCQ questions to MCQ format
-                if q['type'] not in ['MCQ', 'Multiple Choice']:
-                    # If somehow a non-MCQ question exists, treat it as MCQ
-                    if 'options' in q and len(q['options']) > 0:
-                        answer = st.radio("Select your answer:", q['options'], key=f"q_{current_idx}")
-                    else:
-                        # Fallback: create MCQ options
-                        options = ["Option A", "Option B", "Option C", "Option D"]
-                        answer = st.radio("Select your answer:", options, key=f"q_{current_idx}")
-                else:
-                    answer = st.radio("Select your answer:", q['options'], key=f"q_{current_idx}")
+                # Answer options - All questions are Multiple Choice only
+                # Use unique key to prevent duplicate key errors
+                unique_key = f"answer_radio_q{current_idx}_{q.get('type', 'mcq')}"
+                
+                # Ensure we have options
+                if not q.get('options') or len(q['options']) < 4:
+                    st.error("⚠️ This question has incomplete options. Please contact support.")
+                    st.stop()
+                
+                # Validate options are not generic
+                has_generic = False
+                for opt in q['options']:
+                    opt_lower = opt.lower().strip()
+                    if (len(opt_lower.split()) <= 2 and any(p in opt_lower for p in ['option a', 'option b', 'option c', 'option d'])) or \
+                       opt_lower in ['a', 'b', 'c', 'd', 'a.', 'b.', 'c.', 'd.'] or \
+                       ('option' in opt_lower and len(opt_lower.split()) <= 3):
+                        has_generic = True
+                        break
+                
+                if has_generic:
+                    st.error("⚠️ This question has generic options. Regenerating...")
+                    # Clear this question and regenerate
+                    st.session_state.current_questions = []
+                    st.session_state.current_question_index = 0
+                    st.rerun()
+                
+                # Format options with A, B, C, D labels and display radio button
+                formatted_options = [f"{chr(65+i)}. {opt}" for i, opt in enumerate(q['options'])]
+                answer_idx = st.radio("Select your answer:", formatted_options, key=unique_key)
+                # Extract the actual answer text
+                answer = q['options'][formatted_options.index(answer_idx)]
             
             st.markdown("---")
             
