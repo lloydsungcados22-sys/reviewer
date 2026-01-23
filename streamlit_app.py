@@ -71,10 +71,12 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Constants
+# Constants - Revised Tiering System
 FREE_QUESTION_LIMIT = 15
-PREMIUM_QUESTION_LIMIT = 115  # 15 free + 100 additional = 115 total
-PAYMENT_AMOUNT = 50
+ADVANCE_QUESTION_LIMIT = 90  # 15 free + 75 additional = 90 total
+ADVANCE_PAYMENT_AMOUNT = 50  # ₱50 for Advance (75 additional questions)
+PREMIUM_PAYMENT_AMOUNT = 299  # ₱299 for Premium (unlimited questions for 1 month)
+PAYMENT_AMOUNT = ADVANCE_PAYMENT_AMOUNT  # Default for backward compatibility
 GCASH_NUMBER = "0927 159 5709"
 GCASH_NAME = "M**K L***D S."
 RECEIPT_EMAIL = "criminologysupp@gmail.com"
@@ -161,15 +163,21 @@ def init_database():
     conn.commit()
     return conn
 
-# Initialize database
-db_conn = init_database()
+# Initialize database (cached connection)
+@st.cache_resource
+def get_db_connection():
+    """Get cached database connection"""
+    return init_database()
+
+db_conn = get_db_connection()
 
 # ============================================================================
 # SESSION STATE INITIALIZATION
 # ============================================================================
 
 def init_session_state():
-    """Initialize session state variables"""
+    """Initialize session state variables (lazy initialization)"""
+    # Only initialize if not already set to avoid unnecessary work
     defaults = {
         "user_email": None,
         "user_logged_in": False,
@@ -185,13 +193,23 @@ def init_session_state():
         "pdf_name": "",
         "admin_logged_in": False,
         "uploaded_pdfs": [],
-        "selected_pdf": None
+        "selected_pdf": None,
+        "selected_documents": [],  # Document library selections
+        "openai_api_key": None,
+        "openai_model": "gpt-4",
+        "openai_temperature": 0.3,
+        "generation_progress": "",
+        "exam_paused": False,
+        "paused_at_index": 0,
+        "_css_injected": False  # CSS injection flag
     }
     
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+    # Only set missing keys (more efficient than checking each)
+    missing_keys = set(defaults.keys()) - set(st.session_state.keys())
+    for key in missing_keys:
+        st.session_state[key] = defaults[key]
 
+# Initialize session state (runs on every rerun but optimized)
 init_session_state()
 
 # ============================================================================
@@ -302,56 +320,461 @@ def chunk_text(text: str, chunk_size: int = 1000) -> List[str]:
 # QUESTION GENERATION
 # ============================================================================
 
-def generate_questions_llm(text: str, difficulty: str, num_questions: int, question_types: List[str]) -> List[Dict]:
+def deduplicate_questions(questions: List[Dict]) -> List[Dict]:
+    """Remove duplicate or near-duplicate questions"""
+    unique_questions = []
+    seen_texts = set()
+    
+    for q in questions:
+        # Normalize question text for comparison
+        q_text = q.get('question', '').lower().strip()
+        # Remove extra whitespace and special chars
+        q_text_normalized = ' '.join(q_text.split())
+        
+        # Check if similar question already exists
+        is_duplicate = False
+        for seen in seen_texts:
+            # Simple similarity check - if 80% of words match, consider duplicate
+            q_words = set(q_text_normalized.split())
+            seen_words = set(seen.split())
+            if len(q_words) > 0 and len(seen_words) > 0:
+                similarity = len(q_words & seen_words) / max(len(q_words), len(seen_words))
+                if similarity > 0.8:
+                    is_duplicate = True
+                    break
+        
+        if not is_duplicate:
+            unique_questions.append(q)
+            seen_texts.add(q_text_normalized)
+    
+    return unique_questions
+
+def generate_questions_llm(text: str, difficulty: str, num_questions: int, question_types: List[str], progress_callback=None) -> List[Dict]:
     """Generate questions using OpenAI API if available"""
     if not LLM_AVAILABLE:
         return []
     
-    # Try to get API key from secrets or environment
-    api_key = None
-    try:
-        api_key = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY"))
-    except Exception:
-        # Secrets file doesn't exist, try environment variable
-        api_key = os.environ.get("OPENAI_API_KEY")
-    
+    api_key = get_openai_api_key()
     if not api_key:
         return []
     
     try:
-        openai.api_key = api_key
-        client = openai.OpenAI(api_key=api_key)
+        if progress_callback:
+            progress_callback("Connecting to OpenAI API...")
         
-        prompt = f"""Generate {num_questions} {difficulty} level exam questions based on the following criminology review material.
+        # Initialize OpenAI client - handle 'proxies' error
+        # This error can occur even with correct versions due to internal library issues
+        import os
+        import sys
+        
+        # Get the actual OpenAI version being used
+        try:
+            openai_version = openai.__version__
+        except AttributeError:
+            openai_version = "unknown"
+        
+        # Temporarily remove ALL proxy-related environment variables
+        saved_env = {}
+        proxy_keys = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 
+                     'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy',
+                     'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE']
+        for key in proxy_keys:
+            if key in os.environ:
+                saved_env[key] = os.environ.pop(key)
+        
+        # Also clear any proxy settings from httpx (used by OpenAI)
+        try:
+            import httpx
+            # Clear any default proxy settings
+            if hasattr(httpx, '_default_proxy'):
+                httpx._default_proxy = None
+        except:
+            pass
+        
+        try:
+            # Method 1: Try the simplest possible initialization
+            # Don't pass http_client at all - let OpenAI create its own
+            # This avoids any httpx version compatibility issues
+            client = openai.OpenAI(api_key=api_key)
+            
+        except (TypeError, ValueError, AttributeError) as init_error:
+            error_msg = str(init_error)
+            if "proxies" in error_msg.lower() or "unexpected keyword" in error_msg.lower():
+                # The 'proxies' error suggests httpx or OpenAI internal issue
+                # Method 2: Try downgrading httpx or using a workaround
+                try:
+                    # Check httpx version and try to work around
+                    import httpx
+                    httpx_version = getattr(httpx, '__version__', 'unknown')
+                    
+                    # Try creating httpx client with explicit no-proxy config
+                    # Some versions of httpx might have proxy detection that conflicts
+                    http_client = httpx.Client(
+                        timeout=httpx.Timeout(60.0),
+                        follow_redirects=True
+                    )
+                    client = openai.OpenAI(api_key=api_key, http_client=http_client)
+                except Exception as e2:
+                    # Method 3: The issue is likely in OpenAI library itself
+                    # Suggest downgrading OpenAI to a version that works
+                    try:
+                        # Last attempt: try with minimal httpx client
+                        import httpx
+                        # Create client with absolute minimum
+                        http_client = httpx.Client(timeout=60.0)
+                        client = openai.OpenAI(api_key=api_key, http_client=http_client)
+                    except Exception as e3:
+                        # All methods failed - the issue is likely in the library itself
+                        if progress_callback:
+                            progress_callback(f"❌ All client initialization methods failed")
+                        
+                        # The issue is httpx/OpenAI version incompatibility
+                        # Provide clear solution
+                        import httpx
+                        httpx_version = getattr(httpx, '__version__', 'unknown')
+                        
+                        raise Exception(
+                            f"❌ OpenAI client initialization failed: {error_msg}\n\n"
+                            f"**Detected versions:**\n"
+                            f"- OpenAI: {openai_version}\n"
+                            f"- httpx: {httpx_version}\n\n"
+                            f"**The 'proxies' error is a version compatibility issue.**\n\n"
+                            f"**SOLUTION: Downgrade httpx to a compatible version:**\n\n"
+                            f"```bash\n"
+                            f"pip uninstall httpx -y\n"
+                            f"pip install httpx==0.25.2\n"
+                            f"```\n\n"
+                            f"**OR downgrade OpenAI to a stable version:**\n\n"
+                            f"```bash\n"
+                            f"pip uninstall openai -y\n"
+                            f"pip install openai==1.3.0\n"
+                            f"```\n\n"
+                            f"**After changing versions, restart Streamlit completely.**\n\n"
+                            f"Secondary errors:\n- Method 2: {str(e2)}\n- Method 3: {str(e3)}"
+                        )
+            else:
+                raise
+        finally:
+            # Restore environment variables
+            for key, value in saved_env.items():
+                os.environ[key] = value
+        model = get_openai_model()
+        temperature = get_openai_temperature()
+        
+        # Ensure we have enough text for generation
+        if not text or len(text.strip()) < 100:
+            if progress_callback:
+                progress_callback("❌ Document text too short for AI generation")
+            st.error("❌ Document text is too short. Please upload documents with more content.")
+            return []
+        
+        # Prioritize situational questions
+        situational_priority = "situational" in [qt.lower() for qt in question_types]
+        if situational_priority:
+            type_instruction = "Focus heavily on situational/scenario-based questions (at least 60%). Also include: " + ", ".join([qt for qt in question_types if qt.lower() != "situational"])
+        else:
+            type_instruction = ", ".join(question_types)
+        
+        prompt = f"""You are generating questions for the Philippine National Police (PNP) Criminology Licensure Examination. Generate {num_questions} {difficulty} level questions in proper PNP exam format based EXCLUSIVELY on the following review material from the document library.
 
-Text content:
-{text[:4000]}  # Limit context
+CRITICAL: ALL questions MUST be based ONLY on the provided review material. Do NOT use general knowledge or information not found in the material below.
 
-Difficulty: {difficulty}
-Question types: {', '.join(question_types)}
+REVIEW MATERIAL FROM DOCUMENT LIBRARY:
+{text[:4000]}
 
-For each question, provide:
-- question: The question text
-- type: One of {question_types}
-- options: List of 4 options (for MCQ) or ['True', 'False'] (for True/False) or empty list (for identification)
-- correct_answer: The correct answer
-- explanation: Brief explanation
+EXAM FORMAT REQUIREMENTS:
+1. PRIORITY: Generate at least 60% situational/scenario-based questions that test practical application of criminology knowledge in real-world PNP scenarios.
+2. Each question must be in proper PNP exam format with clear, complete answer choices.
+3. Questions should test knowledge relevant to Philippine laws, PNP procedures, and criminology practice.
 
-Return as JSON array of question objects.
+QUESTION TYPES (in priority order):
+{type_instruction}
+
+IMPORTANT: ALL questions MUST be Multiple Choice (MCQ) format ONLY. NO True/False, NO Identification, NO fill-in-the-blank questions.
+
+QUESTION TYPE GUIDELINES (ALL must be MCQ format):
+- Situational/Scenario-based (PRIORITY): Present a realistic scenario involving PNP operations, criminal investigation, or law enforcement. Ask what action should be taken, what law applies, what procedure to follow, or what the correct response is. Provide 4 multiple choice options. Example: "Officer Juan responds to a domestic violence call. The victim is bleeding but refuses medical treatment. What should Officer Juan do first?" with 4 MCQ options.
+- Recall/Definition: Test knowledge of criminology terms, Philippine laws, or PNP procedures with 4 MCQ options
+- Decision-making/Application: Ask how to apply specific laws, procedures, or protocols in given contexts with 4 MCQ options
+- Ethics/Procedure: Focus on PNP Code of Conduct, ethical decision-making, and proper police procedures with 4 MCQ options
+
+REQUIRED FORMAT FOR EACH QUESTION:
+{{
+  "question": "Complete question text with scenario if situational",
+  "type": "One of: {', '.join(question_types)}",
+  "options": ["First complete answer choice (full sentence or phrase)", "Second complete answer choice (full sentence or phrase)", "Third complete answer choice (full sentence or phrase)", "Fourth complete answer choice (full sentence or phrase)"],
+  "correct_answer": "Exact text matching one of the four options above",
+  "explanation": "2-3 sentence explanation of why this is correct, referencing relevant law or procedure"
+}}
+
+CRITICAL REQUIREMENTS - YOU MUST FOLLOW THESE EXACTLY:
+1. ALL questions MUST be Multiple Choice (MCQ) format ONLY - NO True/False, NO Identification, NO fill-in-the-blank
+2. ALL MCQ questions MUST have exactly 4 complete, meaningful answer options
+3. NEVER EVER use generic placeholders like "Option A", "Option B", "Option C", "Option D" - these are STRICTLY FORBIDDEN
+4. NEVER use just "A", "B", "C", "D" as options
+5. NEVER ask questions that require user input like "Enter your answer:" - ALL questions must be multiple choice
+6. Each option must be a complete, meaningful answer that directly relates to the question (minimum 10 characters, preferably a full sentence)
+7. Options should be realistic, plausible alternatives that test actual knowledge
+8. Example of CORRECT format:
+   "options": ["Secure and preserve the crime scene to prevent contamination of evidence", "Arrest all persons present at the scene immediately without investigation", "Remove evidence for safekeeping in the police station before documentation", "Interview witnesses before securing the scene to gather information"]
+9. Example of INCORRECT format (DO NOT USE - STRICTLY FORBIDDEN):
+   "options": ["Option A", "Option B", "Option C", "Option D"]
+   OR: ["HANDOUT", "Option C", "Option B", "Option D"]
+   OR: ["A", "B", "C", "D"]
+10. The correct_answer must exactly match one of the four option texts (word for word)
+11. Questions must be based EXCLUSIVELY on the provided review material from the document library
+12. Focus on Philippine laws, PNP procedures, and criminology practice
+
+VALIDATION CHECKLIST - Verify each question before including:
+✓ Does it have exactly 4 options?
+✓ Are all options complete sentences/phrases with at least 10 characters?
+✓ Are all options meaningful and related to the question?
+✓ Are there NO generic placeholders like "Option A/B/C/D"?
+✓ Does the correct_answer match one of the options exactly?
+✓ If any question fails these checks, DO NOT include it - regenerate or exclude it.
+
+Return ONLY a valid JSON array of question objects. Do not include any markdown formatting, code blocks, or explanations outside the JSON.
 """
         
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=2000
-        )
+        if progress_callback:
+            progress_callback("🤖 Sending request to OpenAI API...")
         
-        # Parse response (simplified - would need proper JSON parsing)
-        # For now, return empty and fall back to rule-based
-        return []
+        try:
+            if progress_callback:
+                progress_callback("🤖 Sending request to OpenAI API (this may take 30-60 seconds)...")
+            # Make API call with explicit parameters
+            # Note: timeout is set at client level, not in create() call
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=5000  # Safe limit for gpt-4 (8192 total context - ~3000 for prompt = ~5000 for completion)
+            )
+            if progress_callback:
+                progress_callback("✓ Received response from OpenAI API")
+        except Exception as api_error:
+            if progress_callback:
+                progress_callback(f"❌ API request failed: {str(api_error)}")
+            raise api_error
+        
+        if progress_callback:
+            progress_callback("Parsing AI-generated questions...")
+        
+        # Parse JSON response
+        import json
+        content = response.choices[0].message.content.strip()
+        
+        # Try to extract JSON from markdown code blocks
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+        
+        try:
+            questions = json.loads(content)
+            if not isinstance(questions, list):
+                questions = [questions]
+            
+            # Ensure all questions have required fields and validate format
+            validated_questions = []
+            for q in questions:
+                # Ensure required fields exist
+                if 'question' not in q or not q['question']:
+                    continue
+                if 'options' not in q or not q['options']:
+                    # If MCQ but no options, skip or add default
+                    if q.get('type', 'MCQ') == 'MCQ':
+                        continue
+                    q['options'] = []
+                if 'type' not in q:
+                    q['type'] = 'MCQ'
+                if 'explanation' not in q:
+                    q['explanation'] = ''
+                if 'correct_answer' not in q:
+                    continue
+                
+                # Validate MCQ options - must have 4 complete options
+                if q['type'] == 'MCQ' and len(q['options']) < 4:
+                    continue
+                
+                # Ensure options are not generic placeholders - STRICT VALIDATION
+                if q['type'] == 'MCQ':
+                    # Check for generic patterns: "Option A", "Option B", "Option C", "Option D"
+                    generic_patterns = ['option a', 'option b', 'option c', 'option d', 'optiona', 'optionb', 'optionc', 'optiond']
+                    has_generic = False
+                    for opt in q['options']:
+                        opt_lower = opt.lower().strip()
+                        # Check if option is too short or matches generic pattern
+                        if len(opt_lower.split()) <= 2 and any(pattern in opt_lower for pattern in generic_patterns):
+                            has_generic = True
+                            break
+                        # Check if option is just "A", "B", "C", "D" or similar
+                        if opt_lower in ['a', 'b', 'c', 'd', 'a.', 'b.', 'c.', 'd.']:
+                            has_generic = True
+                            break
+                        # Check if option contains "Option" followed by letter and is very short
+                        if 'option' in opt_lower and len(opt_lower.split()) <= 3:
+                            has_generic = True
+                            break
+                        # Check if option is just a single letter or very short
+                        if len(opt_lower.strip()) <= 3 and opt_lower.strip() in ['a', 'b', 'c', 'd', 'a.', 'b.', 'c.', 'd.', 'option a', 'option b', 'option c', 'option d']:
+                            has_generic = True
+                            break
+                    
+                    if has_generic:
+                        continue  # Skip questions with generic options
+                    
+                    # Additional check: ensure all options have meaningful content (at least 5 characters)
+                    if any(len(opt.strip()) < 5 for opt in q['options']):
+                        continue
+                    
+                    # Check if options are too similar (might be duplicates) - but allow some similarity
+                    unique_options = set(opt.lower().strip() for opt in q['options'])
+                    if len(unique_options) < 2:  # At least 2 unique options
+                        continue
+                
+                # Ensure correct_answer matches one of the options
+                if q['type'] == 'MCQ' and q['correct_answer'] not in q['options']:
+                    # Try to find a match (case-insensitive)
+                    matched = False
+                    for opt in q['options']:
+                        if opt.strip().lower() == q['correct_answer'].strip().lower():
+                            q['correct_answer'] = opt  # Use the exact option text
+                            matched = True
+                            break
+                    if not matched:
+                        continue  # Skip if no match found
+                
+                validated_questions.append(q)
+            
+            if not validated_questions:
+                if progress_callback:
+                    progress_callback("⚠️ AI generated invalid questions (generic options detected), retrying...")
+                # Show debug info
+                st.warning(f"⚠️ First AI attempt generated {len(questions)} questions but all were rejected due to generic options or validation failures.")
+                st.info("💡 Retrying with stricter prompt...")
+                # Retry with an even more explicit prompt
+                retry_prompt = f"""Generate {num_questions} {difficulty} level PNP Criminology exam questions based on this material:
+
+{text[:3000]}
+
+CRITICAL RULES:
+1. Each question MUST have exactly 4 answer options
+2. NEVER use "Option A", "Option B", "Option C", "Option D" - these are FORBIDDEN
+3. Each option must be a complete sentence or phrase (minimum 5 words)
+4. Options must be meaningful answers related to the question
+
+CORRECT EXAMPLE:
+{{
+  "question": "What is the first step when securing a crime scene?",
+  "type": "Situational",
+  "options": ["Establish a perimeter to prevent unauthorized access", "Collect all evidence immediately", "Interview witnesses on the spot", "Allow media to enter and document"],
+  "correct_answer": "Establish a perimeter to prevent unauthorized access",
+  "explanation": "Securing the perimeter is the first priority to preserve evidence integrity."
+}}
+
+Return ONLY a JSON array. Each option must be a real answer, not a placeholder.
+"""
+                try:
+                    retry_response = client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": retry_prompt}],
+                        temperature=temperature,
+                        max_tokens=5000  # Safe limit for gpt-4 (8192 total context - ~3000 for prompt = ~5000 for completion)
+                    )
+                    retry_content = retry_response.choices[0].message.content.strip()
+                    if "```json" in retry_content:
+                        retry_content = retry_content.split("```json")[1].split("```")[0].strip()
+                    elif "```" in retry_content:
+                        retry_content = retry_content.split("```")[1].split("```")[0].strip()
+                    
+                    retry_questions = json.loads(retry_content)
+                    if not isinstance(retry_questions, list):
+                        retry_questions = [retry_questions]
+                    
+                    # Validate retry questions with same strict rules
+                    validated_retry = []
+                    for q in retry_questions:
+                        if 'question' not in q or not q['question']:
+                            continue
+                        if 'options' not in q or len(q.get('options', [])) < 4:
+                            continue
+                        if 'correct_answer' not in q:
+                            continue
+                        if 'type' not in q:
+                            q['type'] = 'MCQ'
+                        if 'explanation' not in q:
+                            q['explanation'] = ''
+                        
+                        # Strict validation for generic options
+                        has_generic = False
+                        for opt in q['options']:
+                            opt_lower = opt.lower().strip()
+                            if len(opt_lower.split()) <= 2 and any(pattern in opt_lower for pattern in ['option a', 'option b', 'option c', 'option d']):
+                                has_generic = True
+                                break
+                            if opt_lower in ['a', 'b', 'c', 'd', 'a.', 'b.', 'c.', 'd.']:
+                                has_generic = True
+                                break
+                            if 'option' in opt_lower and len(opt_lower.split()) <= 3:
+                                has_generic = True
+                                break
+                            if len(opt.strip()) < 5:
+                                has_generic = True
+                                break
+                        
+                        if has_generic:
+                            continue
+                        
+                        # Ensure correct_answer matches
+                        if q['correct_answer'] not in q['options']:
+                            matched = False
+                            for opt in q['options']:
+                                if opt.strip().lower() == q['correct_answer'].strip().lower():
+                                    q['correct_answer'] = opt
+                                    matched = True
+                                    break
+                            if not matched:
+                                continue
+                        
+                        validated_retry.append(q)
+                    
+                    if validated_retry:
+                        validated_retry = deduplicate_questions(validated_retry)
+                        if progress_callback:
+                            progress_callback(f"✅ Generated {len(validated_retry)} valid questions on retry!")
+                        return validated_retry[:num_questions]
+                    else:
+                        if progress_callback:
+                            progress_callback("❌ Retry also produced invalid questions. Falling back to rule-based...")
+                        st.warning("⚠️ AI retry also failed. Using rule-based generation from your documents...")
+                except Exception as retry_e:
+                    if progress_callback:
+                        progress_callback(f"❌ Retry also failed: {str(retry_e)}")
+                    st.warning(f"Retry failed: {str(retry_e)}. Falling back to rule-based generation...")
+                
+                # Don't return empty - let it fall through to rule-based
+                return []
+            
+            # Deduplicate
+            validated_questions = deduplicate_questions(validated_questions)
+            
+            if progress_callback:
+                progress_callback(f"✅ Generated {len(validated_questions)} valid AI questions in PNP format!")
+            
+            return validated_questions[:num_questions]
+        except json.JSONDecodeError as e:
+            if progress_callback:
+                progress_callback(f"⚠️ JSON parsing error: {str(e)}")
+            st.warning(f"Failed to parse AI response as JSON: {str(e)}")
+            return []
     except Exception as e:
-        st.warning(f"LLM generation failed: {str(e)}. Using rule-based generation.")
+        if progress_callback:
+            progress_callback(f"❌ Error: {str(e)}")
+        error_msg = str(e)
+        st.error(f"❌ AI generation failed: {error_msg}")
+        # Don't show API key errors to users
+        pass
         return []
 
 def generate_questions_rule_based(text: str, difficulty: str, num_questions: int, question_types: List[str]) -> List[Dict]:
@@ -398,10 +821,22 @@ def generate_questions_rule_based(text: str, difficulty: str, num_questions: int
                 })
         
         else:  # MCQ
-            # Create multiple choice
+            # Create multiple choice with meaningful options
             question_text = f"What is described in the following: {chunk[:150]}?"
-            correct = chunk_words[0] if chunk_words else "Option A"
-            options = [correct, "Option B", "Option C", "Option D"]
+            # Extract key terms from chunk for better options
+            key_terms = [w for w in chunk_words[:10] if len(w) > 4][:4]  # Get meaningful words
+            if len(key_terms) < 4:
+                # Pad with related terms
+                key_terms.extend(["procedure", "regulation", "principle", "requirement"][:4-len(key_terms)])
+            
+            correct = key_terms[0] if key_terms else "The described concept"
+            # Create meaningful options based on chunk content
+            options = [
+                correct,
+                f"Alternative approach to {key_terms[1] if len(key_terms) > 1 else 'the concept'}",
+                f"Different method involving {key_terms[2] if len(key_terms) > 2 else 'related elements'}",
+                f"Opposite or unrelated concept to {key_terms[3] if len(key_terms) > 3 else 'the main idea'}"
+            ]
             secrets.SystemRandom().shuffle(options)
             
             questions.append({
@@ -553,24 +988,374 @@ def generate_default_dummy_questions(difficulty: str, num_questions: int, questi
     
     return selected_questions[:num_questions]
 
-def generate_questions(text: str, difficulty: str, num_questions: int, question_types: List[str]) -> List[Dict]:
-    """Generate questions using LLM if available, else rule-based, or default dummy questions"""
-    # If no text provided, use default dummy questions
-    if not text or len(text.strip()) < 50:
-        return generate_default_dummy_questions(difficulty, num_questions, question_types)
+def generate_questions(text: str, difficulty: str, num_questions: int, question_types: List[str], progress_callback=None) -> List[Dict]:
+    """Generate questions using AI from documents. Only use dummy questions if no documents are available."""
+    if progress_callback:
+        progress_callback("Initializing question generation...")
     
-    # Try LLM first
-    llm_questions = generate_questions_llm(text, difficulty, num_questions, question_types)
-    if llm_questions:
-        return llm_questions
+    # Check if we have document text (from admin or user uploads)
+    has_document_text = text and len(text.strip()) >= 50
     
-    # Fall back to rule-based
-    rule_based = generate_questions_rule_based(text, difficulty, num_questions, question_types)
-    if rule_based:
-        return rule_based
+    # If no document text, use default dummy questions
+    if not has_document_text:
+        if progress_callback:
+            progress_callback("No document text found, using default questions...")
+        questions = generate_default_dummy_questions(difficulty, num_questions, question_types)
+        questions = deduplicate_questions(questions)
+        if progress_callback:
+            progress_callback(f"Generated {len(questions)} default questions!")
+        return questions
     
-    # Final fallback to dummy questions
-    return generate_default_dummy_questions(difficulty, num_questions, question_types)
+    # We have document text - MUST use AI generation (no fallback to rule-based for document-based questions)
+    if progress_callback:
+        progress_callback("✓ Document text ready. Starting AI question generation...")
+    
+    # Try AI/LLM generation (REQUIRED for document-based questions)
+    api_key = get_openai_api_key()
+    if not api_key:
+        if progress_callback:
+            progress_callback("❌ AI generation unavailable")
+        # Don't show API key errors to users - silently fall back
+        return []
+    
+    # API key loaded (no user-facing message)
+    if progress_callback:
+        progress_callback("✓ AI generation ready")
+    
+    if progress_callback:
+        progress_callback("🤖 Connecting to OpenAI API...")
+    
+    # Try AI generation with retries
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                if progress_callback:
+                    progress_callback(f"🔄 Retrying AI generation (attempt {attempt + 1}/{max_retries})...")
+            
+            llm_questions = generate_questions_llm(text, difficulty, num_questions, question_types, progress_callback)
+            
+            if llm_questions and len(llm_questions) > 0:
+                if progress_callback:
+                    progress_callback(f"✅ Generated {len(llm_questions)} AI-powered questions from your documents!")
+                st.success(f"✅ Successfully generated {len(llm_questions)} AI questions from your documents!")
+                return llm_questions
+            else:
+                if progress_callback:
+                    progress_callback(f"⚠️ AI generation attempt {attempt + 1} returned no valid questions")
+                if attempt < max_retries - 1:
+                    continue  # Retry
+                else:
+                    # Last attempt failed
+                    st.error("❌ AI generation failed after multiple attempts. Please check:")
+                    st.markdown("""
+                    - Is your OpenAI API key valid and has credits?
+                    - Are the documents properly formatted and contain readable text?
+                    - Try selecting fewer documents or reducing the number of questions
+                    """)
+                    return []
+                    
+        except Exception as e:
+            error_msg = str(e)
+            if progress_callback:
+                progress_callback(f"❌ AI generation error (attempt {attempt + 1}): {error_msg}")
+            
+            if attempt < max_retries - 1:
+                st.warning(f"AI generation attempt {attempt + 1} failed: {error_msg}. Retrying...")
+                continue
+            else:
+                # Last attempt failed
+                st.error(f"❌ AI generation failed after {max_retries} attempts: {error_msg}")
+                st.info("""
+                **Troubleshooting:**
+                1. Please try again or contact support
+                2. Verify you have API credits available
+                3. Check your internet connection
+                4. Try with fewer documents or fewer questions
+                """)
+                import traceback
+                with st.expander("🔍 Detailed Error Information"):
+                    st.code(traceback.format_exc())
+                return []
+    
+    # Should never reach here, but just in case
+    return []
+
+# ============================================================================
+# DOCUMENT LIBRARY MANAGEMENT
+# ============================================================================
+
+@st.cache_data(ttl=60, show_spinner=False)  # Cache for 60 seconds, no spinner
+def get_document_library() -> List[Dict]:
+    """Scan and return all available documents from all sources (cached)"""
+    documents = []
+    
+    def scan_directory(directory: str, source: str) -> List[Dict]:
+        """Helper to scan a directory for documents"""
+        dir_docs = []
+        if not os.path.exists(directory):
+            return dir_docs
+        try:
+            for filename in os.listdir(directory):
+                if filename.lower().endswith(('.pdf', '.docx', '.doc')):
+                    filepath = os.path.join(directory, filename)
+                    try:
+                        file_size = os.path.getsize(filepath)
+                        mtime = os.path.getmtime(filepath)
+                        dir_docs.append({
+                            "filename": filename,
+                            "filepath": filepath,
+                            "source": source,
+                            "date": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d"),
+                            "size": file_size,
+                            "size_mb": round(file_size / (1024 * 1024), 2),
+                            "type": "PDF" if filename.lower().endswith('.pdf') else "Word"
+                        })
+                    except (OSError, ValueError):
+                        continue  # Skip files that can't be accessed
+        except (OSError, PermissionError):
+            pass  # Skip directories that can't be accessed
+        return dir_docs
+    
+    # Only show Admin and User-uploaded files (no dummy files)
+    # 1. Admin-managed PDFs from /admin_docs/
+    admin_docs_dir = "admin_docs"
+    os.makedirs(admin_docs_dir, exist_ok=True)
+    documents.extend(scan_directory(admin_docs_dir, "Admin"))
+    
+    # 2. User-uploaded PDFs from /uploads/ (session-based)
+    uploads_dir = "uploads"
+    os.makedirs(uploads_dir, exist_ok=True)
+    documents.extend(scan_directory(uploads_dir, "Uploaded"))
+    
+    return documents
+
+def extract_text_from_documents(document_paths: List[str], max_pages_per_doc: int = 50, max_total_chars: int = 50000, progress_callback=None) -> str:
+    """Extract and combine text from multiple documents with limits"""
+    combined_text = []
+    total_chars = 0
+    
+    for idx, doc_path in enumerate(document_paths):
+        if total_chars >= max_total_chars:
+            break
+            
+        if not os.path.exists(doc_path):
+            if progress_callback:
+                progress_callback(f"Skipping {os.path.basename(doc_path)} (not found)...")
+            continue
+        
+        try:
+            if progress_callback:
+                progress_callback(f"Extracting text from {os.path.basename(doc_path)} ({idx+1}/{len(document_paths)})...")
+            
+            if doc_path.lower().endswith('.pdf'):
+                if PDF_AVAILABLE:
+                    text, _ = extract_text_from_pdf(doc_path)
+                    if text:
+                        # Limit pages/chars per document
+                        if len(text) > max_pages_per_doc * 1000:  # Rough estimate
+                            text = text[:max_pages_per_doc * 1000]
+                        combined_text.append(text)
+                        total_chars += len(text)
+                        if progress_callback:
+                            progress_callback(f"✓ Extracted {len(text)} chars from {os.path.basename(doc_path)}")
+                else:
+                    if progress_callback:
+                        progress_callback(f"⚠ PDF library not available for {os.path.basename(doc_path)}")
+            elif doc_path.lower().endswith(('.docx', '.doc')):
+                if DOCX_AVAILABLE:
+                    text, _ = extract_text_from_docx(doc_path)
+                    if text:
+                        if len(text) > max_pages_per_doc * 1000:
+                            text = text[:max_pages_per_doc * 1000]
+                        combined_text.append(text)
+                        total_chars += len(text)
+                        if progress_callback:
+                            progress_callback(f"✓ Extracted {len(text)} chars from {os.path.basename(doc_path)}")
+                else:
+                    if progress_callback:
+                        progress_callback(f"⚠ Word library not available for {os.path.basename(doc_path)}")
+        except Exception as e:
+            error_msg = f"Error processing {os.path.basename(doc_path)}: {str(e)}"
+            if progress_callback:
+                progress_callback(f"❌ {error_msg}")
+            st.warning(error_msg)
+            continue
+    
+    result = " ".join(combined_text)
+    if progress_callback:
+        progress_callback(f"✓ Combined {len(result)} total characters from {len(combined_text)} document(s)")
+    return result
+
+# Cache for extracted text
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def get_cached_text(document_paths: Tuple[str]) -> str:
+    """Get cached extracted text for documents"""
+    return extract_text_from_documents(list(document_paths))
+
+# ============================================================================
+# OPENAI API SETTINGS
+# ============================================================================
+
+def get_openai_api_key() -> Optional[str]:
+    """Get OpenAI API key from backend only (secrets.toml or environment variable)"""
+    api_key = None
+    try:
+        # Try secrets.toml first (primary source)
+        if hasattr(st, 'secrets') and st.secrets:
+            api_key = st.secrets.get("OPENAI_API_KEY", None)
+            if api_key and api_key.strip():
+                # Store in session state for quick access
+                st.session_state.openai_api_key = api_key.strip()
+                return api_key.strip()
+    except (AttributeError, KeyError, Exception) as e:
+        # Secrets file might not exist or key not found - this is okay, try env var
+        pass
+    
+    # Fallback: Try environment variable (but don't use if it has proxy settings)
+    api_key = os.environ.get("OPENAI_API_KEY", None)
+    if api_key and api_key.strip():
+        # Check if it's a valid API key format (starts with sk-)
+        if api_key.strip().startswith("sk-"):
+            st.session_state.openai_api_key = api_key.strip()
+            return api_key.strip()
+    
+    return None
+
+def save_openai_settings(api_key: Optional[str], model: str, temperature: float):
+    """Save OpenAI settings to session state (API key is backend-only, not saved from UI)"""
+    # Only save model and temperature from UI
+    # API key is always read from backend (secrets/env)
+    if api_key:
+        # Store in session state for current session (read from backend)
+        st.session_state.openai_api_key = api_key
+    st.session_state.openai_model = model
+    st.session_state.openai_temperature = temperature
+
+def get_openai_model() -> str:
+    """Get selected OpenAI model (default: gpt-4)"""
+    return st.session_state.get("openai_model", "gpt-4")
+
+def get_openai_temperature() -> float:
+    """Get OpenAI temperature setting (default: 0.3 for consistent exams)"""
+    return st.session_state.get("openai_temperature", 0.3)
+
+# ============================================================================
+# EXPORT FUNCTIONS
+# ============================================================================
+
+def export_to_pdf(questions: List[Dict], exam_title: str = "Criminology Practice Exam") -> bytes:
+    """Export questions to PDF format"""
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+        from reportlab.lib.enums import TA_LEFT, TA_CENTER
+        from io import BytesIO
+        
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
+        story = []
+        
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=18,
+            textColor='#1a2332',
+            spaceAfter=30,
+            alignment=TA_CENTER
+        )
+        
+        # Title
+        story.append(Paragraph(exam_title, title_style))
+        story.append(Spacer(1, 0.2*inch))
+        story.append(Paragraph("Instructions: Select the best answer for each question.", styles['Normal']))
+        story.append(Spacer(1, 0.3*inch))
+        
+        # Questions
+        for i, q in enumerate(questions, 1):
+            story.append(Paragraph(f"<b>{i}. {q.get('question', 'N/A')}</b>", styles['Normal']))
+            story.append(Spacer(1, 0.1*inch))
+            
+            # Options
+            options = q.get('options', [])
+            if options:
+                for j, opt in enumerate(options, 1):
+                    letter_opt = chr(64 + j)  # A, B, C, D
+                    story.append(Paragraph(f"&nbsp;&nbsp;&nbsp;{letter_opt}. {opt}", styles['Normal']))
+            
+            story.append(Spacer(1, 0.15*inch))
+        
+        # Answer key
+        story.append(PageBreak())
+        story.append(Paragraph("<b>ANSWER KEY</b>", title_style))
+        story.append(Spacer(1, 0.2*inch))
+        
+        for i, q in enumerate(questions, 1):
+            correct = q.get('correct_answer', 'N/A')
+            explanation = q.get('explanation', '')
+            story.append(Paragraph(f"<b>{i}.</b> {correct}", styles['Normal']))
+            if explanation:
+                story.append(Paragraph(f"&nbsp;&nbsp;&nbsp;<i>Explanation: {explanation}</i>", styles['Normal']))
+            story.append(Spacer(1, 0.1*inch))
+        
+        doc.build(story)
+        buffer.seek(0)
+        return buffer.getvalue()
+    except ImportError:
+        st.error("PDF export requires reportlab. Install with: pip install reportlab")
+        return None
+    except Exception as e:
+        st.error(f"Error generating PDF: {str(e)}")
+        return None
+
+def export_to_docx(questions: List[Dict], exam_title: str = "Criminology Practice Exam") -> bytes:
+    """Export questions to DOCX format"""
+    if not DOCX_AVAILABLE or Document_class is None:
+        st.error("DOCX export requires python-docx. Install with: pip install python-docx")
+        return None
+    
+    try:
+        from io import BytesIO
+        doc = Document_class()
+        
+        # Title
+        title = doc.add_heading(exam_title, 0)
+        doc.add_paragraph("Instructions: Select the best answer for each question.")
+        doc.add_paragraph()
+        
+        # Questions
+        for i, q in enumerate(questions, 1):
+            doc.add_paragraph(f"{i}. {q.get('question', 'N/A')}", style='List Number')
+            options = q.get('options', [])
+            if options:
+                for j, opt in enumerate(options, 1):
+                    letter_opt = chr(64 + j)  # A, B, C, D
+                    doc.add_paragraph(f"   {letter_opt}. {opt}", style='List Bullet')
+            doc.add_paragraph()
+        
+        # Answer key
+        doc.add_page_break()
+        doc.add_heading("ANSWER KEY", level=1)
+        doc.add_paragraph()
+        
+        for i, q in enumerate(questions, 1):
+            correct = q.get('correct_answer', 'N/A')
+            explanation = q.get('explanation', '')
+            doc.add_paragraph(f"{i}. {correct}", style='List Number')
+            if explanation:
+                doc.add_paragraph(f"   Explanation: {explanation}")
+            doc.add_paragraph()
+        
+        buffer = BytesIO()
+        doc.save(buffer)
+        buffer.seek(0)
+        return buffer.getvalue()
+    except Exception as e:
+        st.error(f"Error generating DOCX: {str(e)}")
+        return None
 
 # ============================================================================
 # PREMIUM CODE MANAGEMENT
@@ -648,6 +1433,9 @@ def use_premium_code(code: str, session_id: str):
     """, (code, datetime.now().isoformat(), session_id))
     
     db_conn.commit()
+    
+    # Note: Cache will expire naturally (10s TTL), or can be manually cleared if needed
+    # Streamlit cache_data doesn't support per-parameter clearing, so we rely on short TTL
 
 # ============================================================================
 # USER AUTHENTICATION & MANAGEMENT
@@ -727,8 +1515,9 @@ def update_user_questions_answered(email: str, count: int):
     if result:
         st.session_state.questions_answered = result[0]
 
+@st.cache_data(ttl=60)  # Cache for 1 minute
 def get_user_info(email: str) -> Optional[Dict]:
-    """Get user information"""
+    """Get user information (cached)"""
     cursor = db_conn.cursor()
     cursor.execute("""
         SELECT email, access_level, questions_answered, premium_code_used, is_admin
@@ -761,8 +1550,9 @@ def save_pdf_resource(filename: str, filepath: str, is_premium_only: bool, use_f
           datetime.now().isoformat(), uploaded_by, description))
     db_conn.commit()
 
+@st.cache_data(ttl=300)  # Cache for 5 minutes
 def get_pdf_resources(premium_only: Optional[bool] = None) -> List[Dict]:
-    """Get PDF resources, optionally filtered by premium status"""
+    """Get PDF resources, optionally filtered by premium status (cached)"""
     cursor = db_conn.cursor()
     if premium_only is not None:
         cursor.execute("""
@@ -839,7 +1629,11 @@ def save_payment_receipt(name: str, email: str, reference: str, filename: str):
 # ============================================================================
 
 def inject_pnp_theme_css():
-    """Inject PNP/tactical theme CSS"""
+    """Inject PNP/tactical theme CSS (cached per session)"""
+    # Use session state to cache CSS injection
+    if st.session_state.get("_css_injected", False):
+        return
+    
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Poppins:wght@400;500;600;700;800&display=swap');
@@ -1065,6 +1859,95 @@ def inject_pnp_theme_css():
         color: #d4af37;
         font-weight: 600;
     }
+    
+    /* Mobile Responsive Design */
+    @media (max-width: 768px) {
+        .header-banner h1 {
+            font-size: 1.3rem;
+            letter-spacing: 1px;
+        }
+        
+        .header-banner {
+            padding: 1rem 1rem;
+        }
+        
+        .pnp-card {
+            padding: 1rem;
+            margin: 0.5rem 0;
+        }
+        
+        .stButton>button {
+            padding: 0.5rem 1rem;
+            font-size: 0.9rem;
+        }
+        
+        /* Stack columns on mobile */
+        [data-testid="column"] {
+            width: 100% !important;
+            margin-bottom: 1rem;
+        }
+    }
+    
+    /* High contrast text for dark theme */
+    .stMarkdown, .stText, .stSelectbox label, .stRadio label {
+        color: #e0e0e0 !important;
+    }
+    
+    /* Clear CTA buttons */
+    .cta-button {
+        background: linear-gradient(135deg, #d4af37 0%, #f4d03f 100%);
+        color: #1a2332;
+        font-weight: 700;
+        padding: 1rem 2rem;
+        border-radius: 8px;
+        border: none;
+        box-shadow: 0 4px 15px rgba(212, 175, 55, 0.5);
+        transition: all 0.3s ease;
+    }
+    
+    .cta-button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(212, 175, 55, 0.7);
+    }
+    
+    /* Progress feedback container */
+    .progress-feedback {
+        background: rgba(30, 58, 95, 0.8);
+        border: 1px solid #d4af37;
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin: 1rem 0;
+    }
+    
+    .progress-step {
+        display: flex;
+        align-items: center;
+        margin: 0.5rem 0;
+        color: #e0e0e0;
+    }
+    
+    .progress-step.active {
+        color: #d4af37;
+        font-weight: 600;
+    }
+    
+    .progress-step.completed {
+        color: #28a745;
+    }
+    
+    /* Document library card */
+    .doc-card {
+        background: rgba(30, 58, 95, 0.6);
+        border: 1px solid #2d4a6b;
+        border-radius: 8px;
+        padding: 1rem;
+        margin: 0.5rem 0;
+    }
+    
+    .doc-card.selected {
+        border-color: #d4af37;
+        background: rgba(212, 175, 55, 0.1);
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -1079,7 +1962,6 @@ def render_header():
     st.markdown(f"""
     <div class="header-banner">
         <h1>🛡️ PH CRIMINOLOGY EXAM REVIEWER {badge_html}</h1>
-        <p>PNP-Style Tech Reviewer Console</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1143,7 +2025,7 @@ with st.sidebar:
             st.session_state.user_email[:20] + "..." if len(st.session_state.user_email) > 20 else st.session_state.user_email,
             st.session_state.user_access_level,
             st.session_state.questions_answered,
-            PREMIUM_QUESTION_LIMIT if st.session_state.user_access_level == "Premium" else FREE_QUESTION_LIMIT,
+            999999 if st.session_state.user_access_level == "Premium" else (ADVANCE_QUESTION_LIMIT if st.session_state.user_access_level == "Advance" else FREE_QUESTION_LIMIT),
             "Yes" if st.session_state.pdf_text else "No"
         ), unsafe_allow_html=True)
     else:
@@ -1159,7 +2041,7 @@ with st.sidebar:
             "Yes" if st.session_state.pdf_text else "No",
             len(st.session_state.current_questions),
             st.session_state.questions_answered,
-            PREMIUM_QUESTION_LIMIT if st.session_state.premium_active else FREE_QUESTION_LIMIT,
+            999999 if st.session_state.premium_active else (ADVANCE_QUESTION_LIMIT if st.session_state.user_access_level == "Advance" else FREE_QUESTION_LIMIT),
             "ON" if st.session_state.premium_active else "OFF"
         ), unsafe_allow_html=True)
     
@@ -1214,7 +2096,12 @@ if page == "🏠 Home":
         st.session_state.premium_active = (user_info["access_level"] == "Premium")
     
     # User profile card
-    access_badge = "🔑 PREMIUM" if st.session_state.user_access_level == "Premium" else "🆓 FREE"
+    if st.session_state.user_access_level == "Premium":
+        access_badge = "👑 PREMIUM"
+    elif st.session_state.user_access_level == "Advance":
+        access_badge = "⚡ ADVANCE"
+    else:
+        access_badge = "🆓 FREE"
     render_card(f"👤 User Profile - {access_badge}", f"""
     <p><strong>Email:</strong> {st.session_state.user_email}</p>
     <p><strong>Access Level:</strong> {st.session_state.user_access_level}</p>
@@ -1261,7 +2148,13 @@ if page == "🏠 Home":
     with col2:
         st.metric("Current Mode", st.session_state.user_access_level.upper())
     with col3:
-        max_q = PREMIUM_QUESTION_LIMIT if st.session_state.user_access_level == "Premium" else FREE_QUESTION_LIMIT
+        # Revised tiering system
+        if st.session_state.user_access_level == "Premium":
+            max_q = 999999  # Unlimited
+        elif st.session_state.user_access_level == "Advance":
+            max_q = ADVANCE_QUESTION_LIMIT
+        else:
+            max_q = FREE_QUESTION_LIMIT
         remaining = max_q - st.session_state.questions_answered
         st.metric("Remaining", max(0, remaining))
 
@@ -1270,124 +2163,158 @@ if page == "🏠 Home":
 # ============================================================================
 
 elif page == "📄 Upload Reviewer":
-    st.markdown("# 📄 Upload / Select Reviewer Document")
+    st.markdown("# 📄 Document Library & Upload")
     
     # Check if user is logged in
     if not st.session_state.user_logged_in:
         st.warning("⚠️ Please login first on the Home page to access this feature.")
         st.stop()
     
-    # Option 1: Admin-managed PDFs
-    render_card("📚 Admin-Managed PDFs", """
-    <p>PDFs uploaded by administrators. Premium PDFs are marked with 🔒.</p>
-    """)
-    
-    pdf_resources = get_pdf_resources()
-    if pdf_resources:
-        for pdf in pdf_resources:
+    # Document Library Section
+    with st.container():
+        st.markdown("### 📚 Document Library")
+        st.markdown("Select documents to include in exam generation. Content from selected documents will be combined.")
+        
+        all_documents = get_document_library()
+        
+        if not all_documents:
+            st.info("📭 No documents found. Upload documents below or ask admin to add documents.")
+        else:
+            # Initialize selected documents in session state
+            if "document_selections" not in st.session_state:
+                st.session_state.document_selections = {doc['filepath']: True for doc in all_documents}
+            
+            selected_count = sum(1 for selected in st.session_state.document_selections.values() if selected)
+            
             col1, col2 = st.columns([3, 1])
             with col1:
-                premium_label = "🔒 Premium Only" if pdf['is_premium_only'] else "🆓 Free"
-                ai_label = "🤖 AI Enabled" if pdf['use_for_ai_generation'] else ""
-                st.write(f"**{pdf['filename']}** - {premium_label} {ai_label}")
-                if pdf.get('description'):
-                    st.caption(pdf['description'])
+                st.markdown(f"**{selected_count} of {len(all_documents)} documents selected**")
             with col2:
-                if pdf['is_premium_only'] and st.session_state.user_access_level != "Premium":
-                    st.button("🔒 Premium Only", disabled=True, key=f"lock_{pdf['id']}")
-                else:
-                    if os.path.exists(pdf['filepath']):
-                        with open(pdf['filepath'], "rb") as f:
-                            file_data = f.read()
-                            st.download_button(
-                                "📥 Download",
-                                data=file_data,
-                                file_name=pdf['filename'],
-                                mime="application/pdf",
-                                key=f"dl_{pdf['id']}"
-                            )
-                    else:
-                        st.error("File not found.")
-    else:
-        st.info("No admin-managed PDFs available yet.")
+                if st.button("Select All"):
+                    st.session_state.document_selections = {doc['filepath']: True for doc in all_documents}
+                    st.rerun()
+                if st.button("Deselect All"):
+                    st.session_state.document_selections = {doc['filepath']: False for doc in all_documents}
+                    st.rerun()
+            
+            st.markdown("---")
+            
+            # Display documents with checkboxes
+            for doc in all_documents:
+                doc_path = doc['filepath']
+                is_selected = st.session_state.document_selections.get(doc_path, True)
+                
+                # Source badge
+                source_colors = {
+                    "Dummy": "#28a745",
+                    "Admin": "#d4af37",
+                    "Uploaded": "#007bff"
+                }
+                source_color = source_colors.get(doc['source'], "#6c757d")
+                
+                with st.container():
+                    col1, col2, col3, col4 = st.columns([0.5, 3, 2, 1])
+                    with col1:
+                        checked = st.checkbox("", value=is_selected, key=f"doc_{doc_path}", label_visibility="collapsed")
+                        st.session_state.document_selections[doc_path] = checked
+                    with col2:
+                        st.markdown(f"**{doc['filename']}**")
+                        st.caption(f"📅 {doc['date']} | 📦 {doc['size_mb']} MB | {doc['type']}")
+                    with col3:
+                        st.markdown(f'<span style="background: {source_color}; color: white; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.8rem;">{doc["source"]}</span>', unsafe_allow_html=True)
+                    with col4:
+                        if doc['source'] == "Admin" and doc.get('is_premium_only') and st.session_state.user_access_level != "Premium":
+                            st.markdown("🔒 Premium")
+                        else:
+                            if os.path.exists(doc_path):
+                                with open(doc_path, "rb") as f:
+                                    file_data = f.read()
+                                    st.download_button(
+                                        "📥",
+                                        data=file_data,
+                                        file_name=doc['filename'],
+                                        mime="application/pdf" if doc['type'] == "PDF" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                        key=f"dl_{doc_path}"
+                                    )
+            
+            st.markdown("---")
+            
+            # Preview combined text from selected documents
+            if selected_count > 0:
+                if st.button("🔍 Preview Selected Documents", use_container_width=True):
+                    selected_paths = [doc['filepath'] for doc in all_documents if st.session_state.document_selections.get(doc['filepath'], False)]
+                    if selected_paths:
+                        with st.spinner("Extracting text from selected documents..."):
+                            combined_text = extract_text_from_documents(selected_paths)
+                            if combined_text:
+                                st.session_state.pdf_text = combined_text
+                                st.session_state.pdf_name = f"Combined from {selected_count} document(s)"
+                                st.success(f"✅ Loaded content from {selected_count} document(s)!")
+                                with st.expander("📖 Preview (First 1000 characters)"):
+                                    st.text(combined_text[:1000] + "..." if len(combined_text) > 1000 else combined_text)
+                                st.metric("Total Characters", f"{len(combined_text):,}")
     
     st.markdown("---")
     
-    # Option 2: Use sample PDFs
-    render_card("📚 Sample Reviewers", """
-    <p>Use built-in sample PDFs for practice.</p>
-    """)
-    
-    sample_pdfs = []
-    sample_dir = "sample_pdfs"
-    if os.path.exists(sample_dir):
-        sample_pdfs = [f for f in os.listdir(sample_dir) if f.lower().endswith('.pdf')]
-    
-    if sample_pdfs:
-        selected_sample = st.selectbox("Select Sample PDF", ["None"] + sample_pdfs)
-        if selected_sample != "None":
-            sample_path = os.path.join(sample_dir, selected_sample)
-            text, name = extract_text_from_pdf(sample_path)
+    # Upload New Document Section
+    with st.container():
+        st.markdown("### 📤 Upload New Document")
+        uploaded_file = st.file_uploader("Choose PDF or Word document", type=["pdf", "docx", "doc"], help="Upload your criminology reviewer PDF or Word document")
+        
+        if uploaded_file:
+            # Save to uploads directory
+            uploads_dir = "uploads"
+            os.makedirs(uploads_dir, exist_ok=True)
+            file_path = os.path.join(uploads_dir, uploaded_file.name)
+            
+            with open(file_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            
+            # Extract text
+            file_ext = uploaded_file.name.lower().split('.')[-1] if uploaded_file.name else ""
+            if file_ext == "pdf":
+                text, name = extract_text_from_pdf(uploaded_file)
+            elif file_ext in ["docx", "doc"]:
+                uploaded_file.seek(0)  # Reset file pointer
+                text, name = extract_text_from_docx(uploaded_file)
+            else:
+                text, name = "", ""
+            
             if text:
                 st.session_state.pdf_text = text
                 st.session_state.pdf_name = name
-                st.success(f"✅ Loaded: {name}")
-    else:
-        st.info("No sample PDFs found. Please upload your own document or run `python create_sample_pdfs.py` to generate sample PDFs.")
+                st.success(f"✅ Successfully uploaded and loaded: {name}")
+                # Also update document selections
+                if "document_selections" not in st.session_state:
+                    st.session_state.document_selections = {}
+                st.session_state.document_selections[file_path] = True
+                
+                # Preview
+                with st.expander("📖 Document Preview (First 1000 characters)"):
+                    st.text(text[:1000] + "..." if len(text) > 1000 else text)
+                
+                # Stats
+                word_count = len(text.split())
+                char_count = len(text)
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Word Count", f"{word_count:,}")
+                with col2:
+                    st.metric("Character Count", f"{char_count:,}")
+                
+                st.rerun()
     
     st.markdown("---")
     
-    # Option 2: Upload PDF or Word Document
-    render_card("📤 Upload Your Document", """
-    <p>Upload your own reviewer PDF or Word document files.</p>
-    """)
-    
-    uploaded_file = st.file_uploader("Choose PDF or Word document", type=["pdf", "docx", "doc"], help="Upload your criminology reviewer PDF or Word document")
-    
-    if uploaded_file:
-        file_ext = uploaded_file.name.lower().split('.')[-1] if uploaded_file.name else ""
-        
-        if file_ext == "pdf":
-            text, name = extract_text_from_pdf(uploaded_file)
-        elif file_ext in ["docx", "doc"]:
-            text, name = extract_text_from_docx(uploaded_file)
-            if not text and not name:
-                # Error already shown in extract_text_from_docx
-                pass
-        else:
-            st.error("Unsupported file type. Please upload PDF or Word document (.docx)")
-            text, name = "", ""
-        
-        if text:
-            st.session_state.pdf_text = text
-            st.session_state.pdf_name = name
-            st.success(f"✅ Successfully loaded: {name}")
-            
-            # Preview
-            with st.expander("📖 Document Preview (First 1000 characters)"):
-                st.text(text[:1000] + "..." if len(text) > 1000 else text)
-            
-            # Stats
-            word_count = len(text.split())
-            char_count = len(text)
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Word Count", f"{word_count:,}")
-            with col2:
-                st.metric("Character Count", f"{char_count:,}")
-    
-    st.markdown("---")
-    
-    # Option 3: Use default dummy questions
-    render_card("🎲 Use Default Questions", """
-    <p>Practice with pre-loaded criminology questions without uploading a document.</p>
-    """)
-    
-    if st.button("🎯 Use Default Questions", type="secondary", use_container_width=True):
-        st.session_state.pdf_text = "DEFAULT_DUMMY_QUESTIONS"  # Marker for dummy questions
-        st.session_state.pdf_name = "Default Criminology Questions"
-        st.success("✅ Default questions enabled! You can now go to Practice Exam page.")
-        st.info("💡 Default questions will be used automatically when generating practice exams.")
+    # Use Default Questions Option
+    with st.container():
+        st.markdown("### 🎲 Use Default Questions")
+        st.markdown("Practice with pre-loaded criminology questions without uploading a document.")
+        if st.button("🎯 Use Default Questions", type="secondary", use_container_width=True):
+            st.session_state.pdf_text = "DEFAULT_DUMMY_QUESTIONS"
+            st.session_state.pdf_name = "Default Criminology Questions"
+            st.success("✅ Default questions enabled! You can now go to Practice Exam page.")
+            st.info("💡 Default questions will be used automatically when generating practice exams.")
 
 # ============================================================================
 # PAGE: PRACTICE EXAM
@@ -1401,13 +2328,42 @@ elif page == "🧠 Practice Exam":
         st.warning("⚠️ Please login first on the Home page to access Practice Exam.")
         st.stop()
     
+    # Check for paused exam and offer resume (only show if not currently in a question)
+    if st.session_state.get("exam_paused", False) and st.session_state.get("current_questions") and len(st.session_state.get("current_questions", [])) > 0 and st.session_state.current_question_index == 0:
+        st.markdown("### ⏸️ Paused Exam Detected")
+        paused_at = st.session_state.get("paused_at_index", 0)
+        total_questions = len(st.session_state.current_questions)
+        st.info(f"📊 You have a paused exam. You were on question {paused_at + 1} of {total_questions}.")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("▶️ Resume Exam", type="primary", use_container_width=True):
+                st.session_state.current_question_index = paused_at
+                st.session_state.exam_paused = False
+                st.rerun()
+        with col2:
+            if st.button("🔄 Start New Exam", type="secondary", use_container_width=True):
+                st.session_state.current_questions = []
+                st.session_state.current_question_index = 0
+                st.session_state.answers = {}
+                st.session_state.exam_paused = False
+                st.rerun()
+        st.markdown("---")
+        st.stop()  # Stop here until user resumes or starts new
+    
     # Check if PDF is loaded or default questions enabled
     if not st.session_state.pdf_text:
         st.info("💡 No document loaded. Default dummy questions will be used for practice.")
         # Allow continuing with dummy questions
     
     # Check question limit based on user access level
-    max_questions = PREMIUM_QUESTION_LIMIT if st.session_state.user_access_level == "Premium" else FREE_QUESTION_LIMIT
+    # Revised tiering: Free (15), Advance (90), Premium (unlimited)
+    if st.session_state.user_access_level == "Premium":
+        max_questions = 999999  # Unlimited for Premium
+    elif st.session_state.user_access_level == "Advance":
+        max_questions = ADVANCE_QUESTION_LIMIT
+    else:
+        max_questions = FREE_QUESTION_LIMIT
     remaining = max_questions - st.session_state.questions_answered
     
     if remaining <= 0:
@@ -1416,13 +2372,13 @@ elif page == "🧠 Practice Exam":
         <div class="alert-restricted">
             <h2>🚫 ACCESS RESTRICTED</h2>
             <p style="font-size: 1.2rem; margin: 1rem 0;">You reached the Free Limit (15 Questions).</p>
-            <p>To continue practicing, please:</p>
-            <ol style="text-align: left; display: inline-block; margin: 1rem auto;">
-                <li>Pay ₱50 via GCash to <strong>{GCASH_NUMBER} ({GCASH_NAME})</strong></li>
-                <li>Send receipt to <strong>{RECEIPT_EMAIL}</strong></li>
-                <li>Or enter a Premium Code</li>
-            </ol>
-            <p style="margin-top: 1rem; font-size: 0.9rem; opacity: 0.9;">Premium access will be activated after receipt validation.</p>
+            <p style="font-size: 1rem; margin: 0.5rem 0;">Upgrade to continue practicing:</p>
+            <ul style="text-align: left; display: inline-block; margin: 1rem auto;">
+                <li><strong>Advance Mode (₱{ADVANCE_PAYMENT_AMOUNT}):</strong> Get 75 additional questions (Total: 90 questions)</li>
+                <li><strong>Premium Mode (₱{PREMIUM_PAYMENT_AMOUNT}):</strong> Unlimited questions for 1 month</li>
+            </ul>
+            <p style="margin-top: 1rem; font-size: 0.9rem; opacity: 0.9;">Pay via GCash: <strong>{GCASH_NUMBER}</strong> | Email receipt to: <strong>{RECEIPT_EMAIL}</strong></p>
+            <p style="margin-top: 0.5rem; font-size: 0.9rem; opacity: 0.9;">Access will be activated after receipt validation (12-24 hours).</p>
         </div>
         """.format(GCASH_NUMBER=GCASH_NUMBER, GCASH_NAME=GCASH_NAME, RECEIPT_EMAIL=RECEIPT_EMAIL), unsafe_allow_html=True)
         
@@ -1455,40 +2411,159 @@ elif page == "🧠 Practice Exam":
         col1, col2 = st.columns(2)
         with col1:
             difficulty = st.selectbox("Difficulty Level", ["Easy", "Average", "Difficult"])
-            num_questions = st.number_input("Number of Questions", min_value=1, max_value=min(remaining, 50), value=min(10, remaining))
+            num_questions = st.number_input("Number of Questions", min_value=1, max_value=min(remaining, 10), value=min(10, remaining), help="Maximum 10 questions per practice exam")
+        
+        st.info("ℹ️ **Note:** You can generate up to 10 questions per practice exam. All questions will be Multiple Choice (MCQ) format only.")
         
         with col2:
             question_types = st.multiselect(
                 "Question Types",
-                ["MCQ", "True/False", "Identification"],
-                default=["MCQ", "True/False"]
+                ["Situational", "Recall/Definition", "Decision-making/Application", "Ethics/Procedure", "MCQ"],
+                default=["Situational", "MCQ"],
+                help="All questions will be Multiple Choice (MCQ) format only"
             )
+        
+        # Progress feedback container
+        progress_container = st.empty()
+        
+        def update_progress(message: str):
+            """Update progress feedback"""
+            st.session_state.generation_progress = message
+            try:
+                with progress_container.container():
+                    st.markdown(f"""
+                    <div class="progress-feedback">
+                        <div class="progress-step active">🔄 {message}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            except Exception:
+                # Fallback if container update fails
+                st.info(f"🔄 {message}")
         
         if st.button("🎯 Generate Questions", type="primary", use_container_width=True):
             if not question_types:
                 st.error("Please select at least one question type.")
             else:
-                with st.spinner("Generating questions..."):
-                    # Use empty string if default dummy questions marker
-                    text_for_generation = "" if st.session_state.pdf_text == "DEFAULT_DUMMY_QUESTIONS" else st.session_state.pdf_text
-                    questions = generate_questions(
-                        text_for_generation,
-                        difficulty,
-                        num_questions,
-                        question_types
-                    )
-                    if questions:
-                        st.session_state.current_questions = questions
-                        st.session_state.current_question_index = 0
-                        st.session_state.answers = {}
-                        st.session_state.exam_completed = False
-                        st.success(f"✅ Generated {len(questions)} questions!")
-                        st.rerun()
+                # Get text from selected documents or current PDF
+                text_for_generation = ""
+                
+                # Check if documents are selected in library (PRIORITY)
+                if "document_selections" in st.session_state:
+                    all_docs = get_document_library()
+                    selected_paths = [doc['filepath'] for doc in all_docs if st.session_state.document_selections.get(doc['filepath'], False)]
+                    if selected_paths:
+                        update_progress(f"📄 Reading {len(selected_paths)} selected document(s)...")
+                        try:
+                            text_for_generation = extract_text_from_documents(selected_paths, max_pages_per_doc=50, max_total_chars=50000, progress_callback=update_progress)
+                            if text_for_generation and len(text_for_generation.strip()) >= 100:
+                                update_progress(f"✓ Extracted {len(text_for_generation)} characters from {len(selected_paths)} document(s)")
+                                # Update session state to reflect documents are loaded
+                                st.session_state.pdf_text = text_for_generation
+                                st.session_state.pdf_name = f"Combined from {len(selected_paths)} document(s)"
+                            else:
+                                update_progress("⚠ No sufficient text extracted from documents (need at least 100 characters)")
+                                text_for_generation = ""
+                                st.warning(f"⚠ Could not extract sufficient text from selected documents. Please ensure documents contain readable text.")
+                        except Exception as e:
+                            st.error(f"Error extracting documents: {str(e)}")
+                            update_progress(f"❌ Error: {str(e)}")
+                            text_for_generation = ""
+                            import traceback
+                            with st.expander("🔍 Error Details"):
+                                st.code(traceback.format_exc())
+                
+                # Fall back to session PDF text if no documents selected
+                if not text_for_generation or len(text_for_generation.strip()) < 100:
+                    if st.session_state.pdf_text and st.session_state.pdf_text != "DEFAULT_DUMMY_QUESTIONS":
+                        text_for_generation = st.session_state.pdf_text
+                        update_progress(f"✓ Using previously loaded document text ({len(text_for_generation)} characters)")
                     else:
-                        st.error("Failed to generate questions. Please try again.")
+                        text_for_generation = ""
+                
+                # Generate questions with progress
+                if not text_for_generation or len(text_for_generation.strip()) < 50:
+                    update_progress("⚠️ No document text available. Using default questions...")
+                    text_for_generation = ""
+                else:
+                    update_progress(f"✓ Ready to generate from {len(text_for_generation)} characters of text")
+                
+                update_progress("🚀 Starting question generation...")
+                try:
+                    # Use spinner for long-running operation
+                    with st.spinner("Generating questions... This may take 30-60 seconds. Please wait..."):
+                        questions = generate_questions(
+                            text_for_generation,
+                            difficulty,
+                            num_questions,
+                            question_types,
+                            progress_callback=update_progress
+                        )
+                    
+                    # Debug: Check what was returned
+                    if questions is None:
+                        update_progress("❌ Question generation returned None")
+                        progress_container.empty()
+                        st.error("Question generation returned None. This is a bug - please report this error.")
+                    elif isinstance(questions, list):
+                        if len(questions) > 0:
+                            update_progress(f"✅ Successfully generated {len(questions)} questions!")
+                            # Store questions in session state
+                            st.session_state.current_questions = questions
+                            st.session_state.current_question_index = 0
+                            st.session_state.answers = {}
+                            st.session_state.exam_completed = False
+                            st.session_state.exam_paused = False
+                            progress_container.empty()
+                            st.success(f"✅ Generated {len(questions)} unique questions!")
+                            st.balloons()
+                            # Force rerun to display questions immediately
+                            st.rerun()
+                        else:
+                            update_progress("❌ Question generation returned empty list")
+                            progress_container.empty()
+                            st.error("Failed to generate questions - returned empty list. Please check:")
+                            st.markdown("""
+                            - Are documents properly selected in the Document Library?
+                            - Please try again or contact support
+                            - Do you have API credits available?
+                            - Try selecting fewer documents or reducing the number of questions
+                            """)
+                            # Show debug info
+                            with st.expander("🔍 Debug Information"):
+                                text_len = len(text_for_generation) if text_for_generation else 0
+                                st.write(f"Text length: {text_len}")
+                                st.write(f"Question types: {question_types}")
+                                st.write(f"Difficulty: {difficulty}")
+                                st.write(f"Number requested: {num_questions}")
+                                st.write("Questions returned: 0 (empty list)")
+                    else:
+                        update_progress("❌ No questions generated. Please check your documents.")
+                        progress_container.empty()
+                        st.error("Failed to generate questions. Please check:")
+                        st.markdown("""
+                        - Are documents properly selected in the Document Library?
+                        - Please try again or contact support
+                        - Try selecting fewer documents or reducing the number of questions
+                        """)
+                        # Show debug info
+                        with st.expander("🔍 Debug Information"):
+                            text_len = len(text_for_generation) if text_for_generation else 0
+                            q_count = len(questions) if questions else 0
+                            st.write(f"Text length: {text_len}")
+                            st.write(f"Question types: {question_types}")
+                            st.write(f"Difficulty: {difficulty}")
+                            st.write(f"Number requested: {num_questions}")
+                            st.write(f"Questions returned: {q_count}")
+                except Exception as e:
+                    update_progress(f"❌ Error: {str(e)}")
+                    progress_container.empty()
+                    st.error(f"Error generating questions: {str(e)}")
+                    import traceback
+                    with st.expander("🔍 Error Details"):
+                        st.code(traceback.format_exc())
     
     # Display current question
-    if st.session_state.current_questions:
+    if st.session_state.current_questions and len(st.session_state.current_questions) > 0:
         questions = st.session_state.current_questions
         current_idx = st.session_state.current_question_index
         
@@ -1514,41 +2589,110 @@ elif page == "🧠 Practice Exam":
             <p style="font-size: 1.1rem; margin-bottom: 1rem;">{q['question']}</p>
             """)
             
-            # Answer options
-            if q['type'] == "MCQ":
-                answer = st.radio("Select your answer:", q['options'], key=f"q_{current_idx}")
-            elif q['type'] == "True/False":
-                answer = st.radio("Select your answer:", ["True", "False"], key=f"q_{current_idx}")
-            else:  # Identification
-                answer = st.text_input("Enter your answer:", key=f"q_{current_idx}")
+            # Navigation buttons at top
+            nav_col1, nav_col2, nav_col3 = st.columns([1, 1, 2])
+            with nav_col1:
+                if st.button("🏠 Back to Home", type="secondary", use_container_width=True):
+                    st.session_state.current_questions = []
+                    st.session_state.current_question_index = 0
+                    st.session_state.answers = {}
+                    st.rerun()
+            with nav_col2:
+                if st.button("⏸️ Pause Exam", type="secondary", use_container_width=True):
+                    # Store current progress
+                    st.session_state.exam_paused = True
+                    st.session_state.paused_at_index = current_idx
+                    st.success("⏸️ Exam paused. Your progress has been saved. Answer selection is now disabled until you resume.")
+                    st.rerun()
             
+            st.markdown("---")
+            
+            # Check if exam is paused - disable answer selection
+            is_paused = st.session_state.get("exam_paused", False)
+            
+            if is_paused:
+                st.warning("⏸️ Exam is paused. Click 'Resume Exam' to continue answering questions.")
+                st.info("💡 Your progress has been saved. Use the navigation buttons above to resume or go home.")
+                # Don't show answer options when paused
+                answer = None
+            else:
+                # Answer options
+                if q['type'] == "MCQ":
+                    if not q.get('options') or len(q['options']) < 4:
+                        st.error("⚠️ This question has incomplete options. Please contact support.")
+                        st.stop()
+                    
+                    # Validate options are not generic
+                    has_generic = False
+                    for opt in q['options']:
+                        opt_lower = opt.lower().strip()
+                        if (len(opt_lower.split()) <= 2 and any(p in opt_lower for p in ['option a', 'option b', 'option c', 'option d'])) or \
+                           opt_lower in ['a', 'b', 'c', 'd', 'a.', 'b.', 'c.', 'd.'] or \
+                           ('option' in opt_lower and len(opt_lower.split()) <= 3):
+                            has_generic = True
+                            break
+                    
+                    if has_generic:
+                        st.error("⚠️ This question has generic options. Regenerating...")
+                        # Clear this question and regenerate
+                        st.session_state.current_questions = []
+                        st.session_state.current_question_index = 0
+                        st.rerun()
+                    
+                    # Format options with A, B, C, D labels
+                    formatted_options = [f"{chr(65+i)}. {opt}" for i, opt in enumerate(q['options'])]
+                    answer_idx = st.radio("Select your answer:", formatted_options, key=f"q_{current_idx}")
+                    # Extract the actual answer text
+                    answer = q['options'][formatted_options.index(answer_idx)]
+                # All questions are now Multiple Choice only
+                # Convert any non-MCQ questions to MCQ format
+                if q['type'] not in ['MCQ', 'Multiple Choice']:
+                    # If somehow a non-MCQ question exists, treat it as MCQ
+                    if 'options' in q and len(q['options']) > 0:
+                        answer = st.radio("Select your answer:", q['options'], key=f"q_{current_idx}")
+                    else:
+                        # Fallback: create MCQ options
+                        options = ["Option A", "Option B", "Option C", "Option D"]
+                        answer = st.radio("Select your answer:", options, key=f"q_{current_idx}")
+                else:
+                    answer = st.radio("Select your answer:", q['options'], key=f"q_{current_idx}")
+            
+            st.markdown("---")
+            
+            # Action buttons (disabled if paused)
             col1, col2 = st.columns([1, 4])
             with col1:
-                if st.button("✅ Submit Answer", type="primary"):
-                    st.session_state.answers[current_idx] = answer
-                    st.session_state.current_question_index += 1
-                    # Only count when exam is fully completed
-                    if st.session_state.current_question_index >= len(questions):
-                        if "exam_completed" not in st.session_state or not st.session_state.get("exam_completed", False):
-                            st.session_state.questions_answered += len(questions)
-                            # Update user's question count in database
-                            if st.session_state.user_logged_in and st.session_state.user_email:
-                                update_user_questions_answered(st.session_state.user_email, len(questions))
-                            st.session_state.exam_completed = True
-                    st.rerun()
+                if st.button("✅ Submit Answer", type="primary", use_container_width=True, disabled=is_paused):
+                    if not is_paused and answer is not None:
+                        st.session_state.answers[current_idx] = answer
+                        st.session_state.current_question_index += 1
+                        # Only count when exam is fully completed
+                        if st.session_state.current_question_index >= len(questions):
+                            if "exam_completed" not in st.session_state or not st.session_state.get("exam_completed", False):
+                                st.session_state.questions_answered += len(questions)
+                                # Update user's question count in database
+                                if st.session_state.user_logged_in and st.session_state.user_email:
+                                    update_user_questions_answered(st.session_state.user_email, len(questions))
+                                st.session_state.exam_completed = True
+                        st.rerun()
+                    elif is_paused:
+                        st.warning("⏸️ Exam is paused. Please resume to continue.")
             
             with col2:
-                if st.button("⏭️ Skip", type="secondary"):
-                    st.session_state.current_question_index += 1
-                    # Only count when exam is fully completed
-                    if st.session_state.current_question_index >= len(questions):
-                        if "exam_completed" not in st.session_state or not st.session_state.get("exam_completed", False):
-                            st.session_state.questions_answered += len(questions)
-                            # Update user's question count in database
-                            if st.session_state.user_logged_in and st.session_state.user_email:
-                                update_user_questions_answered(st.session_state.user_email, len(questions))
-                            st.session_state.exam_completed = True
-                    st.rerun()
+                if st.button("⏭️ Skip", type="secondary", use_container_width=True, disabled=is_paused):
+                    if not is_paused:
+                        st.session_state.current_question_index += 1
+                        # Only count when exam is fully completed
+                        if st.session_state.current_question_index >= len(questions):
+                            if "exam_completed" not in st.session_state or not st.session_state.get("exam_completed", False):
+                                st.session_state.questions_answered += len(questions)
+                                # Update user's question count in database
+                                if st.session_state.user_logged_in and st.session_state.user_email:
+                                    update_user_questions_answered(st.session_state.user_email, len(questions))
+                                st.session_state.exam_completed = True
+                        st.rerun()
+                    elif is_paused:
+                        st.warning("⏸️ Exam is paused. Please resume to continue.")
         else:
             # Show results
             st.markdown("# 📊 Exam Results")
@@ -1610,6 +2754,42 @@ elif page == "🧠 Practice Exam":
                 <p style="color: {perf_color}; font-weight: 600; font-size: 1.1rem; margin: 0;">{perf_msg}</p>
             </div>
             """, unsafe_allow_html=True)
+            
+            # Export options
+            st.markdown("### 📥 Export Exam")
+            col1, col2 = st.columns(2)
+            with col1:
+                exam_title = st.text_input("Exam Title", value=f"Criminology Practice Exam - {datetime.now().strftime('%Y-%m-%d')}")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                pdf_data = export_to_pdf(questions, exam_title)
+                if pdf_data:
+                    st.download_button(
+                        "📄 Download as PDF",
+                        data=pdf_data,
+                        file_name=f"{exam_title.replace(' ', '_')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+            with col2:
+                docx_data = export_to_docx(questions, exam_title)
+                if docx_data:
+                    st.download_button(
+                        "📝 Download as DOCX",
+                        data=docx_data,
+                        file_name=f"{exam_title.replace(' ', '_')}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True
+                    )
+            
+            # Regenerate button
+            st.markdown("---")
+            if st.button("🔄 Regenerate Exam (New Questions)", type="secondary", use_container_width=True):
+                st.session_state.current_questions = []
+                st.session_state.current_question_index = 0
+                st.session_state.answers = {}
+                st.rerun()
             
             # Review wrong answers
             if wrong_answers:
@@ -1720,21 +2900,34 @@ elif page == "🔑 Premium Access":
                     db_conn.commit()
                     st.session_state.user_access_level = "Premium"
                 
-                st.success("✅ Premium access activated! You now have access to 115 total questions (15 free + 100 premium).")
+                if st.session_state.user_access_level == "Premium":
+                    st.success("✅ Premium access activated! You now have unlimited questions for 1 month.")
+                elif st.session_state.user_access_level == "Advance":
+                    st.success("✅ Advance access activated! You now have access to 90 total questions (15 free + 75 advance).")
+                else:
+                    st.success("✅ Access updated!")
                 st.balloons()
             else:
                 st.error(f"❌ {message}")
         else:
             st.error("Please enter a premium code.")
     
-    if st.session_state.premium_active or st.session_state.user_access_level == "Premium":
-        st.markdown("""
+    if st.session_state.premium_active or st.session_state.user_access_level in ["Premium", "Advance"]:
+        access_level = st.session_state.user_access_level
+        if access_level == "Premium":
+            msg = "You have unlimited questions for 1 month!"
+        elif access_level == "Advance":
+            msg = "You have access to 90 total questions (15 free + 75 advance)!"
+        else:
+            msg = "Premium access active!"
+        
+        st.markdown(f"""
         <div class="alert-premium">
-            <h2>✅ PREMIUM ACCESS ACTIVE</h2>
-            <p>You have access to 115 total questions (15 free + 100 premium)!</p>
-            <p>Code used: <strong>{}</strong></p>
+            <h2>✅ {access_level.upper()} ACCESS ACTIVE</h2>
+            <p>{msg}</p>
+            <p>Code used: <strong>{st.session_state.premium_code_used or "Admin Activated"}</strong></p>
         </div>
-        """.format(st.session_state.premium_code_used or "Admin Activated"), unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 
 # ============================================================================
 # PAGE: PAYMENT
@@ -1743,19 +2936,39 @@ elif page == "🔑 Premium Access":
 elif page == "💳 Payment":
     st.markdown("# 💳 Payment & Receipt Upload")
     
-    render_card("💰 Payment Instructions", f"""
-    <h3 style="color: #d4af37; margin-top: 0;">Payment Method:</h3>
+    render_card("💰 Payment Tiers", f"""
+    <h3 style="color: #d4af37; margin-top: 0;">Choose Your Plan:</h3>
+    
+    <div style="background: rgba(30, 58, 95, 0.6); border: 2px solid #2d4a6b; border-radius: 12px; padding: 1.5rem; margin: 1rem 0;">
+        <h4 style="color: #d4af37; margin-top: 0;">🆓 FREE MODE</h4>
+        <p style="margin: 0.5rem 0;"><strong>15 questions</strong> - No payment required</p>
+    </div>
+    
+    <div style="background: rgba(30, 58, 95, 0.6); border: 2px solid #d4af37; border-radius: 12px; padding: 1.5rem; margin: 1rem 0;">
+        <h4 style="color: #d4af37; margin-top: 0;">⚡ ADVANCE MODE</h4>
+        <p style="margin: 0.5rem 0;"><strong>₱{ADVANCE_PAYMENT_AMOUNT}</strong> - Get <strong>75 additional questions</strong> (Total: 90 questions)</p>
+        <p style="margin: 0.5rem 0; font-size: 0.9rem; color: #b0b0b0;">Perfect for focused practice sessions</p>
+    </div>
+    
+    <div style="background: rgba(212, 175, 55, 0.2); border: 2px solid #d4af37; border-radius: 12px; padding: 1.5rem; margin: 1rem 0;">
+        <h4 style="color: #d4af37; margin-top: 0;">👑 PREMIUM MODE</h4>
+        <p style="margin: 0.5rem 0;"><strong>₱{PREMIUM_PAYMENT_AMOUNT}</strong> - <strong>Unlimited questions</strong> for 1 month</p>
+        <p style="margin: 0.5rem 0; font-size: 0.9rem; color: #b0b0b0;">Best value for intensive exam preparation</p>
+    </div>
+    
+    <h3 style="color: #d4af37; margin-top: 1.5rem;">💳 Payment Method:</h3>
     <ul>
-        <li>Pay <strong>₱{PAYMENT_AMOUNT}</strong> via GCash</li>
+        <li>Pay via GCash</li>
         <li>GCash Number: <strong>{GCASH_NUMBER}</strong></li>
         <li>Account Name: <strong>{GCASH_NAME}</strong></li>
     </ul>
     
     <h3 style="color: #d4af37; margin-top: 1rem;">📩 Receipt Submission:</h3>
     <p>Email your payment receipt to: <strong>{RECEIPT_EMAIL}</strong></p>
+    <p style="font-size: 0.9rem; color: #b0b0b0;">Please specify in your email which plan you're purchasing (Advance or Premium)</p>
     
     <div style="background: rgba(212, 175, 55, 0.2); border-left: 4px solid #d4af37; padding: 1rem; border-radius: 8px; margin-top: 1rem;">
-        <p style="color: #d4af37; font-weight: 600; margin: 0;">⚠️ Important: Premium access will be activated after receipt validation.</p>
+        <p style="color: #d4af37; font-weight: 600; margin: 0;">⚠️ Important: Access will be activated after receipt validation.</p>
         <p style="color: #e0e0e0; margin: 0.5rem 0 0 0; font-size: 0.9rem;">Please allow 12-24 hours for processing after submitting your receipt.</p>
     </div>
     """)
@@ -1789,6 +3002,10 @@ elif page == "💳 Payment":
                 
                 save_payment_receipt(full_name, email, gcash_ref, receipt_filename)
                 st.success("✅ Payment request and receipt submitted! We'll review it within 12-24 hours.")
+
+# ============================================================================
+# PAGE: ADMIN PANEL
+# ============================================================================
 
 # ============================================================================
 # PAGE: ADMIN PANEL
@@ -1927,8 +3144,8 @@ elif page == "🛠️ Admin Panel":
         
         # Upload new PDF
         st.markdown("#### 📤 Upload New PDF")
-        with st.form("upload_pdf_admin"):
-            uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf", "docx", "doc"], key="admin_pdf_upload")
+        with st.form("upload_pdf_admin_tab4"):
+            uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf", "docx", "doc"], key="admin_pdf_upload_tab4")
             is_premium_only = st.checkbox("Premium Only", value=False, help="Only Premium users can download this PDF")
             use_for_ai = st.checkbox("Use for AI Question Generation", value=True, help="Include this PDF in AI question generation")
             description = st.text_area("Description (optional)", placeholder="Brief description of this PDF")
@@ -1985,117 +3202,18 @@ elif page == "🛠️ Admin Panel":
     with tab5:
         st.markdown("### 👥 User Management")
         
-        # Get all users
-        cursor = db_conn.cursor()
-        cursor.execute("""
-            SELECT email, access_level, questions_answered, created_at, last_login
-            FROM users
-            ORDER BY created_at DESC
-        """)
+        # Get all users (cached for admin panel)
+        @st.cache_data(ttl=120)  # Cache for 2 minutes
+        def get_all_users_cached():
+            cursor = db_conn.cursor()
+            cursor.execute("""
+                SELECT email, access_level, questions_answered, created_at, last_login
+                FROM users
+                ORDER BY created_at DESC
+            """)
+            return cursor.fetchall()
         
-        users_data = cursor.fetchall()
-        
-        if users_data:
-            df = pd.DataFrame(users_data, columns=["Email", "Access Level", "Questions Answered", "Created At", "Last Login"])
-            
-            # Search
-            search_email = st.text_input("🔍 Search User by Email", placeholder="Enter email to search")
-            if search_email:
-                df = df[df["Email"].str.contains(search_email.lower(), na=False, case=False)]
-            
-            st.dataframe(df, use_container_width=True, hide_index=True)
-            
-            st.markdown("---")
-            st.markdown("#### ⚡ Update User Access")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                user_email_update = st.text_input("User Email", placeholder="user@example.com")
-                new_access_level = st.selectbox("New Access Level", ["Free", "Premium"], key="user_access_update")
-            with col2:
-                st.markdown("<br>", unsafe_allow_html=True)
-                if st.button("💾 Update Access Level", type="primary", use_container_width=True):
-                    if user_email_update:
-                        update_user_access_level(user_email_update.lower(), new_access_level)
-                        st.success(f"✅ User {user_email_update} access updated to {new_access_level}")
-                        st.rerun()
-                    else:
-                        st.error("Please enter a user email.")
-        else:
-            st.info("No users registered yet.")
-    
-    with tab4:
-        st.markdown("### 📄 PDF Resource Management")
-        
-        # Upload new PDF
-        st.markdown("#### 📤 Upload New PDF")
-        with st.form("upload_pdf_admin"):
-            uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf", "docx", "doc"], key="admin_pdf_upload")
-            is_premium_only = st.checkbox("Premium Only", value=False, help="Only Premium users can download this PDF")
-            use_for_ai = st.checkbox("Use for AI Question Generation", value=True, help="Include this PDF in AI question generation")
-            description = st.text_area("Description (optional)", placeholder="Brief description of this PDF")
-            
-            if st.form_submit_button("📤 Upload PDF", type="primary", use_container_width=True):
-                if uploaded_pdf:
-                    # Save file
-                    pdf_dir = "data/admin_pdfs"
-                    os.makedirs(pdf_dir, exist_ok=True)
-                    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uploaded_pdf.name}"
-                    filepath = os.path.join(pdf_dir, filename)
-                    
-                    with open(filepath, "wb") as f:
-                        f.write(uploaded_pdf.getbuffer())
-                    
-                    save_pdf_resource(filename, filepath, is_premium_only, use_for_ai, st.session_state.user_email or "admin", description)
-                    st.success(f"✅ PDF uploaded successfully: {filename}")
-                    st.rerun()
-                else:
-                    st.error("Please select a PDF file to upload.")
-        
-        st.markdown("---")
-        
-        # List PDFs
-        st.markdown("#### 📋 Manage PDFs")
-        pdf_resources = get_pdf_resources()
-        
-        if pdf_resources:
-            for pdf in pdf_resources:
-                with st.expander(f"📄 {pdf['filename']} - {'🔒 Premium' if pdf['is_premium_only'] else '🆓 Free'} - {'🤖 AI Enabled' if pdf['use_for_ai_generation'] else '❌ AI Disabled'}"):
-                    col1, col2 = st.columns([2, 1])
-                    with col1:
-                        st.write(f"**Description:** {pdf.get('description', 'No description')}")
-                        st.write(f"**Uploaded:** {pdf['uploaded_at']}")
-                        st.write(f"**Uploaded by:** {pdf.get('uploaded_by', 'Unknown')}")
-                    with col2:
-                        premium_toggle = st.checkbox("Premium Only", value=pdf['is_premium_only'], key=f"premium_{pdf['id']}")
-                        ai_toggle = st.checkbox("Use for AI", value=pdf['use_for_ai_generation'], key=f"ai_{pdf['id']}")
-                        
-                        if st.button("💾 Update", key=f"update_{pdf['id']}"):
-                            update_pdf_resource(pdf['id'], premium_toggle, ai_toggle)
-                            st.success("✅ Updated!")
-                            st.rerun()
-                        
-                        if st.button("🗑️ Delete", key=f"delete_{pdf['id']}"):
-                            if os.path.exists(pdf['filepath']):
-                                os.remove(pdf['filepath'])
-                            delete_pdf_resource(pdf['id'])
-                            st.success("✅ Deleted!")
-                            st.rerun()
-        else:
-            st.info("No PDFs uploaded yet.")
-    
-    with tab5:
-        st.markdown("### 👥 User Management")
-        
-        # Get all users
-        cursor = db_conn.cursor()
-        cursor.execute("""
-            SELECT email, access_level, questions_answered, created_at, last_login
-            FROM users
-            ORDER BY created_at DESC
-        """)
-        
-        users_data = cursor.fetchall()
+        users_data = get_all_users_cached()
         
         if users_data:
             df = pd.DataFrame(users_data, columns=["Email", "Access Level", "Questions Answered", "Created At", "Last Login"])
@@ -2113,12 +3231,15 @@ elif page == "🛠️ Admin Panel":
             col1, col2 = st.columns(2)
             with col1:
                 user_email_update = st.text_input("User Email", placeholder="user@example.com")
-                new_access_level = st.selectbox("New Access Level", ["Free", "Premium"], key="user_access_update")
+                new_access_level = st.selectbox("New Access Level", ["Free", "Advance", "Premium"], key="user_access_update")
             with col2:
                 st.markdown("<br>", unsafe_allow_html=True)
                 if st.button("💾 Update Access Level", type="primary", use_container_width=True):
                     if user_email_update:
                         update_user_access_level(user_email_update.lower(), new_access_level)
+                        # Clear relevant caches
+                        get_all_users_cached.clear()
+                        get_user_info.clear(user_email_update.lower())
                         st.success(f"✅ User {user_email_update} access updated to {new_access_level}")
                         st.rerun()
                     else:
@@ -2137,5 +3258,3 @@ st.markdown("""
     <p>© 2024 PH Criminology Exam Reviewer</p>
 </div>
 """, unsafe_allow_html=True)
-
-
