@@ -113,6 +113,16 @@ def init_database():
         )
     """)
     
+    # Add access_level column if it doesn't exist (for existing databases)
+    cursor.execute("PRAGMA table_info(premium_codes)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if 'access_level' not in columns:
+        try:
+            cursor.execute("ALTER TABLE premium_codes ADD COLUMN access_level TEXT DEFAULT 'Premium'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column might have been added by another process
+    
     # Code usage tracking
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS code_usage (
@@ -1103,12 +1113,12 @@ def generate_questions(text: str, difficulty: str, num_questions: int, question_
 # ============================================================================
 
 @st.cache_data(ttl=60, show_spinner=False)  # Cache for 60 seconds, no spinner
-def get_document_library() -> List[Dict]:
-    """Scan and return all available documents from all sources (cached)"""
+def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
+    """Scan and return documents from Admin and current user only (filtered by email)"""
     documents = []
     
-    def scan_directory(directory: str, source: str) -> List[Dict]:
-        """Helper to scan a directory for documents"""
+    def scan_directory(directory: str, source: str, filter_email: Optional[str] = None) -> List[Dict]:
+        """Helper to scan a directory for documents, optionally filtered by user email"""
         dir_docs = []
         if not os.path.exists(directory):
             return dir_docs
@@ -1117,6 +1127,25 @@ def get_document_library() -> List[Dict]:
                 if filename.lower().endswith(('.pdf', '.docx', '.doc')):
                     filepath = os.path.join(directory, filename)
                     try:
+                        # Check if file belongs to the user (email in filename or check database)
+                        if filter_email and source == "Uploaded":
+                            # Check if filename contains user email or check database
+                            user_email_clean = filter_email.lower().replace('@', '_').replace('.', '_')
+                            if user_email_clean not in filename.lower():
+                                # Check database for user association
+                                cursor = db_conn.cursor()
+                                cursor.execute("""
+                                    SELECT uploaded_by FROM pdf_resources 
+                                    WHERE filepath = ? OR filename = ?
+                                """, (filepath, filename))
+                                result = cursor.fetchone()
+                                if result and result[0] and result[0].lower() != filter_email.lower():
+                                    continue  # Skip files not uploaded by this user
+                                elif not result:
+                                    # If not in database, check filename pattern
+                                    if user_email_clean not in filename.lower():
+                                        continue
+                        
                         file_size = os.path.getsize(filepath)
                         mtime = os.path.getmtime(filepath)
                         dir_docs.append({
@@ -1134,16 +1163,68 @@ def get_document_library() -> List[Dict]:
             pass  # Skip directories that can't be accessed
         return dir_docs
     
-    # Only show Admin and User-uploaded files (no dummy files)
-    # 1. Admin-managed PDFs from /admin_docs/
+    # 1. Admin-managed PDFs from /admin_docs/ (always show)
     admin_docs_dir = "admin_docs"
     os.makedirs(admin_docs_dir, exist_ok=True)
     documents.extend(scan_directory(admin_docs_dir, "Admin"))
     
-    # 2. User-uploaded PDFs from /uploads/ (session-based)
-    uploads_dir = "uploads"
-    os.makedirs(uploads_dir, exist_ok=True)
-    documents.extend(scan_directory(uploads_dir, "Uploaded"))
+    # 2. User-uploaded PDFs from /uploads/ (filtered by user email)
+    if user_email:
+        uploads_dir = "uploads"
+        os.makedirs(uploads_dir, exist_ok=True)
+        # Get user's documents from database
+        cursor = db_conn.cursor()
+        cursor.execute("""
+            SELECT filepath, filename FROM pdf_resources 
+            WHERE uploaded_by = ?
+        """, (user_email.lower(),))
+        user_docs = cursor.fetchall()
+        
+        # Add documents from database
+        for doc_path, doc_filename in user_docs:
+            if os.path.exists(doc_path):
+                try:
+                    file_size = os.path.getsize(doc_path)
+                    mtime = os.path.getmtime(doc_path)
+                    documents.append({
+                        "filename": doc_filename,
+                        "filepath": doc_path,
+                        "source": "Uploaded",
+                        "date": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d"),
+                        "size": file_size,
+                        "size_mb": round(file_size / (1024 * 1024), 2),
+                        "type": "PDF" if doc_filename.lower().endswith('.pdf') else "Word"
+                    })
+                except (OSError, ValueError):
+                    continue
+        
+        # Also scan uploads directory for files with user email in filename
+        user_email_clean = user_email.lower().replace('@', '_').replace('.', '_')
+        uploads_dir = "uploads"
+        if os.path.exists(uploads_dir):
+            try:
+                for filename in os.listdir(uploads_dir):
+                    if filename.lower().endswith(('.pdf', '.docx', '.doc')):
+                        # Check if filename contains user email pattern
+                        if user_email_clean in filename.lower():
+                            filepath = os.path.join(uploads_dir, filename)
+                            if filepath not in [d['filepath'] for d in documents]:  # Avoid duplicates
+                                try:
+                                    file_size = os.path.getsize(filepath)
+                                    mtime = os.path.getmtime(filepath)
+                                    documents.append({
+                                        "filename": filename,
+                                        "filepath": filepath,
+                                        "source": "Uploaded",
+                                        "date": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d"),
+                                        "size": file_size,
+                                        "size_mb": round(file_size / (1024 * 1024), 2),
+                                        "type": "PDF" if filename.lower().endswith('.pdf') else "Word"
+                                    })
+                                except (OSError, ValueError):
+                                    continue
+            except (OSError, PermissionError):
+                pass
     
     return documents
 
@@ -1237,6 +1318,34 @@ def get_openai_api_key() -> Optional[str]:
             st.session_state.openai_api_key = api_key.strip()
             return api_key.strip()
     
+    return None
+
+def get_admin_password() -> Optional[str]:
+    """Get admin password from secrets.toml or environment variables (required)"""
+    # Check if already cached in session state
+    if "admin_password" in st.session_state:
+        return st.session_state.admin_password
+    
+    password = None
+    try:
+        # Try to get from Streamlit secrets first (primary source)
+        if hasattr(st, 'secrets') and st.secrets:
+            password = st.secrets.get("ADMIN_PASSWORD", None)
+            if password and password.strip():
+                # Store in session state for quick access
+                st.session_state.admin_password = password.strip()
+                return password.strip()
+    except (AttributeError, KeyError, Exception):
+        # Secrets file might not exist or key not found - try env var
+        pass
+    
+    # Fallback: Try environment variable
+    password = os.environ.get("ADMIN_PASSWORD", None)
+    if password and password.strip():
+        st.session_state.admin_password = password.strip()
+        return password.strip()
+    
+    # No default password - must be set in secrets.toml or environment variable
     return None
 
 def save_openai_settings(api_key: Optional[str], model: str, temperature: float):
@@ -1388,8 +1497,8 @@ def generate_premium_code(length: int = 12) -> str:
     alphabet = string.ascii_uppercase + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
-def create_premium_codes(num_codes: int, length: int, expiry_days: Optional[int], max_uses: int, created_by: str) -> List[str]:
-    """Create premium codes in database"""
+def create_premium_codes(num_codes: int, length: int, expiry_days: Optional[int], max_uses: int, created_by: str, access_level: str = "Premium") -> List[str]:
+    """Create premium codes in database with specified access level"""
     codes = []
     cursor = db_conn.cursor()
     
@@ -1399,43 +1508,75 @@ def create_premium_codes(num_codes: int, length: int, expiry_days: Optional[int]
         if expiry_days:
             expiry = (datetime.now() + timedelta(days=expiry_days)).isoformat()
         
-        cursor.execute("""
-            INSERT INTO premium_codes (code, status, expiry_date, max_uses, uses_left, created_at, created_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (code, "active", expiry, max_uses, max_uses, datetime.now().isoformat(), created_by))
+        # Check if access_level column exists
+        cursor.execute("PRAGMA table_info(premium_codes)")
+        columns = [col[1] for col in cursor.fetchall()]
+        has_access_level = 'access_level' in columns
+        
+        if has_access_level:
+            cursor.execute("""
+                INSERT INTO premium_codes (code, status, expiry_date, max_uses, uses_left, created_at, created_by, access_level)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (code, "active", expiry, max_uses, max_uses, datetime.now().isoformat(), created_by, access_level))
+        else:
+            # Fallback for databases without access_level column
+            cursor.execute("""
+                INSERT INTO premium_codes (code, status, expiry_date, max_uses, uses_left, created_at, created_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (code, "active", expiry, max_uses, max_uses, datetime.now().isoformat(), created_by))
         
         codes.append(code)
     
     db_conn.commit()
     return codes
 
-def validate_premium_code(code: str) -> Tuple[bool, str]:
-    """Validate a premium code"""
+def validate_premium_code(code: str) -> Tuple[bool, str, Optional[str]]:
+    """Validate a premium code and return access level"""
     cursor = db_conn.cursor()
-    cursor.execute("""
-        SELECT status, expiry_date, uses_left, max_uses
-        FROM premium_codes
-        WHERE code = ?
-    """, (code,))
     
-    result = cursor.fetchone()
-    if not result:
-        return False, "Code not found"
+    # Check if access_level column exists
+    cursor.execute("PRAGMA table_info(premium_codes)")
+    columns = [col[1] for col in cursor.fetchall()]
+    has_access_level = 'access_level' in columns
     
-    status, expiry_date, uses_left, max_uses = result
+    if has_access_level:
+        cursor.execute("""
+            SELECT status, expiry_date, uses_left, max_uses, access_level
+            FROM premium_codes
+            WHERE code = ?
+        """, (code,))
+        
+        result = cursor.fetchone()
+        if not result:
+            return False, "Code not found", None
+        
+        status, expiry_date, uses_left, max_uses, access_level = result
+    else:
+        cursor.execute("""
+            SELECT status, expiry_date, uses_left, max_uses
+            FROM premium_codes
+            WHERE code = ?
+        """, (code,))
+        
+        result = cursor.fetchone()
+        if not result:
+            return False, "Code not found", None
+        
+        status, expiry_date, uses_left, max_uses = result
+        access_level = "Premium"  # Default for old codes
     
     if status != "active":
-        return False, "Code is inactive"
+        return False, "Code is inactive", None
     
     if expiry_date:
         expiry = datetime.fromisoformat(expiry_date)
         if datetime.now() > expiry:
-            return False, "Code has expired"
+            return False, "Code has expired", None
     
     if uses_left <= 0:
-        return False, "Code has no uses left"
+        return False, "Code has no uses left", None
     
-    return True, "Valid"
+    return True, "Valid", access_level
 
 def use_premium_code(code: str, session_id: str):
     """Mark a premium code as used"""
@@ -2014,6 +2155,18 @@ def render_badge(text: str, color: str):
     badge_class = f"badge-{color.lower()}"
     return f'<span class="{badge_class}">{text}</span>'
 
+# Helper function for admin panel - get all users (cached)
+@st.cache_data(ttl=120)  # Cache for 2 minutes
+def get_all_users_cached():
+    """Get all users for admin panel (cached)"""
+    cursor = db_conn.cursor()
+    cursor.execute("""
+        SELECT email, access_level, questions_answered, created_at, last_login
+        FROM users
+        ORDER BY created_at DESC
+    """)
+    return cursor.fetchall()
+
 # Inject theme
 inject_pnp_theme_css()
 render_header()
@@ -2197,7 +2350,9 @@ elif page == "📄 Upload Reviewer":
         st.markdown("### 📚 Document Library")
         st.markdown("Select documents to include in exam generation. Content from selected documents will be combined.")
         
-        all_documents = get_document_library()
+        # Get documents filtered by current user email
+        current_user_email = st.session_state.user_email if st.session_state.user_logged_in else None
+        all_documents = get_document_library(user_email=current_user_email)
         
         if not all_documents:
             st.info("📭 No documents found. Upload documents below or ask admin to add documents.")
@@ -2284,13 +2439,28 @@ elif page == "📄 Upload Reviewer":
         uploaded_file = st.file_uploader("Choose PDF or Word document", type=["pdf", "docx", "doc"], help="Upload your criminology reviewer PDF or Word document")
         
         if uploaded_file:
-            # Save to uploads directory
+            # Save to uploads directory with user email in filename
             uploads_dir = "uploads"
             os.makedirs(uploads_dir, exist_ok=True)
-            file_path = os.path.join(uploads_dir, uploaded_file.name)
+            
+            # Generate unique filename with timestamp and user email
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_ext = os.path.splitext(uploaded_file.name)[1]
+            user_email_clean = ""
+            if st.session_state.user_logged_in and st.session_state.user_email:
+                user_email_clean = st.session_state.user_email.lower().replace('@', '_').replace('.', '_') + "_"
+            filename = f"{user_email_clean}{timestamp}_{uploaded_file.name}"
+            file_path = os.path.join(uploads_dir, filename)
             
             with open(file_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
+            
+            # Save to database with user email
+            if st.session_state.user_logged_in and st.session_state.user_email:
+                try:
+                    save_pdf_resource(filename, file_path, False, True, st.session_state.user_email, f"Uploaded by {st.session_state.user_email}")
+                except Exception:
+                    pass  # Continue even if database save fails
             
             # Extract text
             file_ext = uploaded_file.name.lower().split('.')[-1] if uploaded_file.name else ""
@@ -2310,6 +2480,9 @@ elif page == "📄 Upload Reviewer":
                 if "document_selections" not in st.session_state:
                     st.session_state.document_selections = {}
                 st.session_state.document_selections[file_path] = True
+                
+                # Clear cache to refresh document library
+                get_document_library.clear()
                 
                 # Preview
                 with st.expander("📖 Document Preview (First 1000 characters)"):
@@ -2471,7 +2644,8 @@ elif page == "🧠 Practice Exam":
                 
                 # Check if documents are selected in library (PRIORITY)
                 if "document_selections" in st.session_state:
-                    all_docs = get_document_library()
+                    current_user_email = st.session_state.user_email if st.session_state.user_logged_in else None
+                    all_docs = get_document_library(user_email=current_user_email)
                     selected_paths = [doc['filepath'] for doc in all_docs if st.session_state.document_selections.get(doc['filepath'], False)]
                     if selected_paths:
                         update_progress(f"📄 Reading {len(selected_paths)} selected document(s)...")
@@ -2920,17 +3094,19 @@ elif page == "🔑 Premium Access":
     
     code_input = st.text_input("Enter Premium Code:", placeholder="ABCD1234EFGH", help="Enter your premium access code")
     
-    if st.button("🔓 Activate Premium", type="primary", use_container_width=True):
+    if st.button("🔓 Activate Access", type="primary", use_container_width=True):
         if code_input:
-            is_valid, message = validate_premium_code(code_input.strip().upper())
+            is_valid, message, access_level = validate_premium_code(code_input.strip().upper())
             if is_valid:
                 st.session_state.premium_active = True
                 st.session_state.premium_code_used = code_input.strip().upper()
                 use_premium_code(code_input.strip().upper(), st.session_state.get("session_id", "default"))
                 
-                # Update user access level in database
+                # Update user access level in database based on code's access level
                 if st.session_state.user_logged_in and st.session_state.user_email:
-                    update_user_access_level(st.session_state.user_email, "Premium")
+                    # Use the access level from the code
+                    code_access_level = access_level if access_level else "Premium"
+                    update_user_access_level(st.session_state.user_email, code_access_level)
                     cursor = db_conn.cursor()
                     cursor.execute("""
                         UPDATE users
@@ -2938,19 +3114,19 @@ elif page == "🔑 Premium Access":
                         WHERE email = ?
                     """, (code_input.strip().upper(), st.session_state.user_email))
                     db_conn.commit()
-                    st.session_state.user_access_level = "Premium"
+                    st.session_state.user_access_level = code_access_level
                 
-                if st.session_state.user_access_level == "Premium":
+                if access_level == "Premium":
                     st.success("✅ Premium access activated! You now have unlimited questions for 1 month.")
-                elif st.session_state.user_access_level == "Advance":
+                elif access_level == "Advance":
                     st.success("✅ Advance access activated! You now have access to 90 total questions (15 free + 75 advance).")
                 else:
-                    st.success("✅ Access updated!")
+                    st.success(f"✅ {access_level} access activated!")
                 st.balloons()
             else:
                 st.error(f"❌ {message}")
         else:
-            st.error("Please enter a premium code.")
+            st.error("Please enter an access code.")
     
     if st.session_state.premium_active or st.session_state.user_access_level in ["Premium", "Advance"]:
         access_level = st.session_state.user_access_level
@@ -3047,10 +3223,6 @@ elif page == "💳 Payment":
 # PAGE: ADMIN PANEL
 # ============================================================================
 
-# ============================================================================
-# PAGE: ADMIN PANEL
-# ============================================================================
-
 elif page == "🛠️ Admin Panel":
     st.markdown("# 🛠️ Admin Command Center")
     
@@ -3063,13 +3235,12 @@ elif page == "🛠️ Admin Panel":
         admin_password = st.text_input("Admin Password", type="password", key="admin_pw")
         
         if st.button("🔓 Login", type="primary", use_container_width=True):
-            # Try to get password from secrets, environment, or use default
-            correct_password = "banban1231"  # Default
-            try:
-                correct_password = st.secrets.get("ADMIN_PASSWORD", os.environ.get("ADMIN_PASSWORD", "banban1231"))
-            except Exception:
-                # Secrets file doesn't exist, try environment variable or use default
-                correct_password = os.environ.get("ADMIN_PASSWORD", "banban1231")
+            # Get admin password from secrets.toml (required)
+            correct_password = get_admin_password()
+            
+            if not correct_password:
+                st.error("❌ Admin password not configured. Please set ADMIN_PASSWORD in secrets.toml or environment variables.")
+                st.stop()
             
             if admin_password == correct_password:
                 st.session_state.admin_logged_in = True
@@ -3083,27 +3254,37 @@ elif page == "🛠️ Admin Panel":
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔑 Generate Codes", "📋 Code Database", "💳 Receipt Validation", "📄 PDF Management", "👥 User Management"])
     
     with tab1:
-        st.markdown("### 🔑 Generate Premium Codes")
+        st.markdown("### 🔑 Generate Access Codes")
         
         with st.form("generate_codes"):
             col1, col2 = st.columns(2)
             with col1:
                 num_codes = st.number_input("Number of Codes", min_value=1, max_value=100, value=5)
                 code_length = st.number_input("Code Length", min_value=8, max_value=20, value=12)
+                access_level = st.selectbox(
+                    "Access Level",
+                    ["Advance", "Premium"],
+                    help="Advance: +75 questions (total 90). Premium: Unlimited questions for 1 month"
+                )
             with col2:
                 expiry_days = st.number_input("Expiry (Days, 0 = No expiry)", min_value=0, max_value=365, value=30)
                 max_uses = st.number_input("Max Uses per Code", min_value=1, max_value=100, value=1)
             
             if st.form_submit_button("🎯 Generate Codes", type="primary", use_container_width=True):
                 expiry = expiry_days if expiry_days > 0 else None
-                codes = create_premium_codes(num_codes, code_length, expiry, max_uses, "admin")
+                codes = create_premium_codes(num_codes, code_length, expiry, max_uses, "admin", access_level)
                 st.session_state.generated_codes = codes
-                st.success(f"✅ Generated {len(codes)} premium codes!")
+                st.session_state.generated_codes_access_level = access_level
+                st.success(f"✅ Generated {len(codes)} {access_level} access codes!")
                 st.rerun()
         
         # Display codes and download button outside form
         if "generated_codes" in st.session_state and st.session_state.generated_codes:
-            codes_df = pd.DataFrame({"Code": st.session_state.generated_codes})
+            access_level = st.session_state.get("generated_codes_access_level", "Premium")
+            codes_df = pd.DataFrame({
+                "Code": st.session_state.generated_codes,
+                "Access Level": [access_level] * len(st.session_state.generated_codes)
+            })
             st.dataframe(codes_df, use_container_width=True, hide_index=True)
             
             # Export CSV
@@ -3111,7 +3292,7 @@ elif page == "🛠️ Admin Panel":
             st.download_button(
                 "⬇️ Download Codes as CSV",
                 data=csv,
-                file_name=f"premium_codes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                file_name=f"{access_level.lower()}_codes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv"
             )
     
@@ -3119,16 +3300,37 @@ elif page == "🛠️ Admin Panel":
         st.markdown("### 📋 Code Database")
         
         cursor = db_conn.cursor()
-        cursor.execute("""
-            SELECT code, status, expiry_date, max_uses, uses_left, created_at
-            FROM premium_codes
-            ORDER BY created_at DESC
-        """)
         
-        codes_data = cursor.fetchall()
+        # Check if access_level column exists
+        cursor.execute("PRAGMA table_info(premium_codes)")
+        columns = [col[1] for col in cursor.fetchall()]
+        has_access_level = 'access_level' in columns
         
-        if codes_data:
-            df = pd.DataFrame(codes_data, columns=["Code", "Status", "Expiry", "Max Uses", "Uses Left", "Created At"])
+        if has_access_level:
+            cursor.execute("""
+                SELECT code, status, expiry_date, max_uses, uses_left, created_at, access_level
+                FROM premium_codes
+                ORDER BY created_at DESC
+            """)
+            codes_data = cursor.fetchall()
+            if codes_data:
+                df = pd.DataFrame(codes_data, columns=["Code", "Status", "Expiry", "Max Uses", "Uses Left", "Created At", "Access Level"])
+            else:
+                df = None
+        else:
+            cursor.execute("""
+                SELECT code, status, expiry_date, max_uses, uses_left, created_at
+                FROM premium_codes
+                ORDER BY created_at DESC
+            """)
+            codes_data = cursor.fetchall()
+            if codes_data:
+                df = pd.DataFrame(codes_data, columns=["Code", "Status", "Expiry", "Max Uses", "Uses Left", "Created At"])
+                df["Access Level"] = "Premium"  # Default for old codes
+            else:
+                df = None
+        
+        if df is not None and not df.empty:
             st.dataframe(df, use_container_width=True, hide_index=True)
             
             # Search and filter
@@ -3161,20 +3363,107 @@ elif page == "🛠️ Admin Panel":
             
             st.dataframe(df, use_container_width=True, hide_index=True)
             
+            # Display receipt images
+            st.markdown("### 📷 View Receipt")
+            receipt_id_view = st.number_input("Receipt ID to View", min_value=1, key="receipt_view_id")
+            
+            if receipt_id_view:
+                cursor.execute("""
+                    SELECT receipt_filename, full_name, email, status
+                    FROM payment_receipts
+                    WHERE id = ?
+                """, (receipt_id_view,))
+                receipt_info = cursor.fetchone()
+                
+                if receipt_info:
+                    receipt_filename, full_name, email, status = receipt_info
+                    st.markdown(f"**Name:** {full_name} | **Email:** {email} | **Status:** {status}")
+                    
+                    if receipt_filename:
+                        receipt_path = os.path.join("data", "receipts", receipt_filename)
+                        if os.path.exists(receipt_path):
+                            # Check if it's an image
+                            if receipt_filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                                st.image(receipt_path, caption=f"Receipt for {full_name}", use_container_width=True)
+                            elif receipt_filename.lower().endswith('.pdf'):
+                                st.info("📄 PDF receipt file. Download to view.")
+                                with open(receipt_path, "rb") as f:
+                                    st.download_button(
+                                        "📥 Download Receipt PDF",
+                                        data=f.read(),
+                                        file_name=receipt_filename,
+                                        mime="application/pdf"
+                                    )
+                            else:
+                                st.warning(f"⚠️ Receipt file format not supported for preview: {receipt_filename}")
+                        else:
+                            st.error(f"❌ Receipt file not found: {receipt_filename}")
+                    else:
+                        st.info("No receipt file uploaded for this submission.")
+                else:
+                    st.warning(f"⚠️ Receipt ID {receipt_id_view} not found.")
+            
             # Approve/Reject actions
             st.markdown("### ⚡ Actions")
-            receipt_id = st.number_input("Receipt ID to Update", min_value=1)
+            receipt_id = st.number_input("Receipt ID to Update", min_value=1, key="receipt_update_id")
             new_status = st.selectbox("New Status", ["Pending", "Approved", "Rejected"])
             admin_notes = st.text_area("Admin Notes")
             
             if st.button("💾 Update Status", type="primary"):
+                # Get receipt info before updating
+                cursor.execute("""
+                    SELECT email, full_name
+                    FROM payment_receipts
+                    WHERE id = ?
+                """, (receipt_id,))
+                receipt_info = cursor.fetchone()
+                
+                # Update receipt status
                 cursor.execute("""
                     UPDATE payment_receipts
                     SET status = ?, reviewed_at = ?, reviewed_by = ?, notes = ?
                     WHERE id = ?
                 """, (new_status, datetime.now().isoformat(), "admin", admin_notes, receipt_id))
                 db_conn.commit()
-                st.success(f"✅ Receipt #{receipt_id} updated to {new_status}")
+                
+                # If approved, update user access level
+                if new_status == "Approved" and receipt_info:
+                    receipt_email = receipt_info[0]
+                    receipt_name = receipt_info[1]
+                    
+                    # Determine access level based on payment amount or notes
+                    # Check if user exists, create if not
+                    cursor.execute("SELECT email FROM users WHERE email = ?", (receipt_email.lower(),))
+                    user_exists = cursor.fetchone()
+                    
+                    if not user_exists:
+                        # Create user account
+                        cursor.execute("""
+                            INSERT INTO users (email, access_level, questions_answered, created_at, last_login, is_admin)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (receipt_email.lower(), "Free", 0, datetime.now().isoformat(), datetime.now().isoformat(), 0))
+                    
+                    # Determine access level - check notes for "Advance" or "Premium", default to Premium
+                    access_level = "Premium"  # Default for approved receipts
+                    if admin_notes and "advance" in admin_notes.lower():
+                        access_level = "Advance"
+                    elif admin_notes and "premium" in admin_notes.lower():
+                        access_level = "Premium"
+                    else:
+                        # Try to infer from payment amount (if stored) or default to Premium
+                        access_level = "Premium"
+                    
+                    # Update user access level
+                    update_user_access_level(receipt_email.lower(), access_level)
+                    st.success(f"✅ Receipt #{receipt_id} updated to {new_status} and user {receipt_email} access set to {access_level}")
+                else:
+                    st.success(f"✅ Receipt #{receipt_id} updated to {new_status}")
+                
+                # Clear caches - use try/except in case function not defined yet
+                try:
+                    get_all_users_cached.clear()
+                except:
+                    pass
                 st.rerun()
         else:
             st.info("No payment receipts submitted yet.")
@@ -3242,20 +3531,57 @@ elif page == "🛠️ Admin Panel":
     with tab5:
         st.markdown("### 👥 User Management")
         
-        # Get all users (cached for admin panel)
-        @st.cache_data(ttl=120)  # Cache for 2 minutes
-        def get_all_users_cached():
-            cursor = db_conn.cursor()
-            cursor.execute("""
-                SELECT email, access_level, questions_answered, created_at, last_login
-                FROM users
-                ORDER BY created_at DESC
-            """)
-            return cursor.fetchall()
-        
         users_data = get_all_users_cached()
         
+        # Get approved receipts
+        cursor = db_conn.cursor()
+        cursor.execute("""
+            SELECT email, full_name, status, reviewed_at, notes
+            FROM payment_receipts
+            WHERE status = 'Approved'
+            ORDER BY reviewed_at DESC
+        """)
+        approved_receipts = cursor.fetchall()
+        
+        # Add new user section
+        st.markdown("#### ➕ Add New User")
+        with st.form("add_user_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                new_user_email = st.text_input("Email Address *", placeholder="user@example.com", key="new_user_email")
+                new_user_access = st.selectbox("Initial Access Level", ["Free", "Advance", "Premium"], key="new_user_access")
+            with col2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.form_submit_button("➕ Add User", type="primary", use_container_width=True):
+                    if new_user_email and "@" in new_user_email and "." in new_user_email.split("@")[1]:
+                        # Check if user already exists
+                        cursor.execute("SELECT email FROM users WHERE email = ?", (new_user_email.lower(),))
+                        if cursor.fetchone():
+                            st.error(f"❌ User with email {new_user_email} already exists.")
+                        else:
+                            # Create new user
+                            cursor.execute("""
+                                INSERT INTO users (email, access_level, questions_answered, created_at, last_login, is_admin)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                            """, (new_user_email.lower(), new_user_access, 0, datetime.now().isoformat(), datetime.now().isoformat(), 0))
+                            db_conn.commit()
+                            get_all_users_cached.clear()
+                            st.success(f"✅ User {new_user_email} added with {new_user_access} access!")
+                            st.rerun()
+                    else:
+                        st.error("❌ Please enter a valid email address.")
+        
+        st.markdown("---")
+        
+        # Display approved receipts
+        if approved_receipts:
+            st.markdown("#### ✅ Approved Receipts (Users)")
+            receipts_df = pd.DataFrame(approved_receipts, columns=["Email", "Name", "Status", "Approved At", "Notes"])
+            st.dataframe(receipts_df, use_container_width=True, hide_index=True)
+            st.markdown("---")
+        
         if users_data:
+            st.markdown("#### 📊 All Users")
             df = pd.DataFrame(users_data, columns=["Email", "Access Level", "Questions Answered", "Created At", "Last Login"])
             
             # Search
@@ -3270,7 +3596,7 @@ elif page == "🛠️ Admin Panel":
             
             col1, col2 = st.columns(2)
             with col1:
-                user_email_update = st.text_input("User Email", placeholder="user@example.com")
+                user_email_update = st.text_input("User Email", placeholder="user@example.com", key="update_user_email")
                 new_access_level = st.selectbox("New Access Level", ["Free", "Advance", "Premium"], key="user_access_update")
             with col2:
                 st.markdown("<br>", unsafe_allow_html=True)
