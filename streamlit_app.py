@@ -1403,10 +1403,10 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
                             user_email_clean = filter_email.lower().replace('@', '_').replace('.', '_')
                             if user_email_clean not in filename.lower():
                                 # Check database for user association
-                                table_name = get_table_name("pdf_resources")
-                                cursor = execute_query(f"""
+                            table_name = get_table_name("pdf_resources")
+                            cursor = execute_query(f"""
                                     SELECT uploaded_by FROM {table_name} 
-                                    WHERE filepath = ? OR filename = ?
+                                    WHERE filepath = %s OR filename = %s
                                 """, (filepath, filename))
                                 result = cursor.fetchone()
                                 cursor.close()
@@ -1430,7 +1430,7 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
                                 table_name = get_table_name("pdf_resources")
                                 cursor_check = execute_query(f"""
                                     SELECT is_downloadable FROM {table_name} 
-                                    WHERE filepath = ? OR filename = ?
+                                    WHERE filepath = %s OR filename = %s
                                 """, (filepath, filename))
                                 result_check = cursor_check.fetchone()
                                 cursor_check.close()
@@ -1806,13 +1806,13 @@ def create_premium_codes(num_codes: int, length: int, expiry_days: Optional[int]
         if has_access_level:
             cursor = execute_query(f"""
                 INSERT INTO {table_name} (code, status, expiry_date, max_uses, uses_left, created_at, created_by, access_level)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """, (code, "active", expiry, max_uses, max_uses, datetime.now().isoformat(), created_by, access_level))
         else:
             # Fallback for databases without access_level column
             cursor = execute_query(f"""
                 INSERT INTO {table_name} (code, status, expiry_date, max_uses, uses_left, created_at, created_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (code, "active", expiry, max_uses, max_uses, datetime.now().isoformat(), created_by))
         
         codes.append(code)
@@ -1834,7 +1834,7 @@ def validate_premium_code(code: str) -> Tuple[bool, str, Optional[str]]:
         cursor = execute_query(f"""
             SELECT status, expiry_date, uses_left, max_uses, access_level
             FROM {table_name}
-            WHERE code = ?
+            WHERE code = %s
         """, (code,))
         
         result = cursor.fetchone()
@@ -1847,7 +1847,7 @@ def validate_premium_code(code: str) -> Tuple[bool, str, Optional[str]]:
         cursor = execute_query(f"""
             SELECT status, expiry_date, uses_left, max_uses
             FROM {table_name}
-            WHERE code = ?
+            WHERE code = %s
         """, (code,))
         
         result = cursor.fetchone()
@@ -1880,14 +1880,14 @@ def use_premium_code(code: str, session_id: str):
     cursor = execute_query(f"""
         UPDATE {premium_table}
         SET uses_left = uses_left - 1
-        WHERE code = ?
+        WHERE code = %s
     """, (code,))
     cursor.close()
     
     # Record usage
     cursor = execute_query(f"""
         INSERT INTO {usage_table} (code, used_at, session_id)
-        VALUES (?, ?, ?)
+        VALUES (%s, %s, %s)
     """, (code, datetime.now().isoformat(), session_id))
     cursor.close()
     
@@ -1910,7 +1910,7 @@ def login_user(email: str) -> Tuple[bool, Dict]:
     cursor = execute_query(f"""
         SELECT email, access_level, questions_answered, premium_code_used, is_admin
         FROM {table_name}
-        WHERE email = ?
+        WHERE email = %s
     """, (email,))
     
     result = cursor.fetchone()
@@ -1920,8 +1920,8 @@ def login_user(email: str) -> Tuple[bool, Dict]:
         # User exists, update last login
         cursor = execute_query(f"""
             UPDATE {table_name}
-            SET last_login = ?
-            WHERE email = ?
+            SET last_login = %s
+            WHERE email = %s
         """, (datetime.now().isoformat(), email))
         cursor.close()
         
@@ -1939,7 +1939,7 @@ def login_user(email: str) -> Tuple[bool, Dict]:
         # Create new user with Free access
         cursor = execute_query(f"""
             INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
         """, (email, "Free", 0, datetime.now().isoformat(), datetime.now().isoformat(), 0))
         cursor.close()
         
@@ -1959,8 +1959,8 @@ def update_user_access_level(email: str, access_level: str):
     table_name = get_table_name("users")
     cursor = execute_query(f"""
         UPDATE {table_name}
-        SET access_level = ?
-        WHERE email = ?
+        SET access_level = %s
+        WHERE email = %s
     """, (access_level, email))
     cursor.close()
     
@@ -1972,8 +1972,8 @@ def update_user_questions_answered(email: str, count: int):
     table_name = get_table_name("users")
     cursor = execute_query(f"""
         UPDATE {table_name}
-        SET questions_answered = questions_answered + ?
-        WHERE email = ?
+        SET questions_answered = questions_answered + %s
+        WHERE email = %s
     """, (count, email))
     cursor.close()
     
@@ -1982,7 +1982,7 @@ def update_user_questions_answered(email: str, count: int):
     
     # Also update session state
     cursor = execute_query(f"""
-        SELECT questions_answered FROM {table_name} WHERE email = ?
+        SELECT questions_answered FROM {table_name} WHERE email = %s
     """, (email,))
     result = cursor.fetchone()
     cursor.close()
@@ -1996,7 +1996,7 @@ def get_user_info(email: str) -> Optional[Dict]:
     cursor = execute_query(f"""
         SELECT email, access_level, questions_answered, premium_code_used, is_admin
         FROM {table_name}
-        WHERE email = ?
+        WHERE email = %s
     """, (email,))
     # execute_query should normally return a valid cursor, but guard against None
     if cursor is None:
@@ -2028,13 +2028,13 @@ def save_pdf_resource(filename: str, filepath: str, is_premium_only: bool, use_f
     if has_downloadable:
         cursor = execute_query(f"""
             INSERT INTO {table_name} (filename, filepath, is_premium_only, use_for_ai_generation, uploaded_at, uploaded_by, description, is_downloadable)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (filename, filepath, 1 if is_premium_only else 0, 1 if use_for_ai else 0, 
               datetime.now().isoformat(), uploaded_by, description, 1 if is_downloadable else 0))
     else:
         cursor = execute_query(f"""
             INSERT INTO {table_name} (filename, filepath, is_premium_only, use_for_ai_generation, uploaded_at, uploaded_by, description)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (filename, filepath, 1 if is_premium_only else 0, 1 if use_for_ai else 0, 
               datetime.now().isoformat(), uploaded_by, description))
     cursor.close()
@@ -2055,14 +2055,14 @@ def get_pdf_resources(premium_only: Optional[bool] = None) -> List[Dict]:
             cursor = execute_query(f"""
                 SELECT id, filename, filepath, is_premium_only, use_for_ai_generation, uploaded_at, description, is_downloadable
                 FROM {table_name}
-                WHERE is_premium_only = ?
+                WHERE is_premium_only = %s
                 ORDER BY uploaded_at DESC
             """, (1 if premium_only else 0,))
         else:
             cursor = execute_query(f"""
                 SELECT id, filename, filepath, is_premium_only, use_for_ai_generation, uploaded_at, description
                 FROM {table_name}
-                WHERE is_premium_only = ?
+                WHERE is_premium_only = %s
                 ORDER BY uploaded_at DESC
             """, (1 if premium_only else 0,))
     else:
@@ -2103,11 +2103,11 @@ def update_pdf_resource(resource_id: int, is_premium_only: Optional[bool] = None
     params = []
     
     if is_premium_only is not None:
-        updates.append("is_premium_only = ?")
+        updates.append("is_premium_only = %s")
         params.append(1 if is_premium_only else 0)
     
     if use_for_ai is not None:
-        updates.append("use_for_ai_generation = ?")
+        updates.append("use_for_ai_generation = %s")
         params.append(1 if use_for_ai else 0)
     
     if updates:
@@ -2115,7 +2115,7 @@ def update_pdf_resource(resource_id: int, is_premium_only: Optional[bool] = None
         cursor = execute_query(f"""
             UPDATE {table_name}
             SET {', '.join(updates)}
-            WHERE id = ?
+            WHERE id = %s
         """, tuple(params))
         cursor.close()
         
@@ -2125,7 +2125,7 @@ def update_pdf_resource(resource_id: int, is_premium_only: Optional[bool] = None
 def delete_pdf_resource(resource_id: int):
     """Delete PDF resource"""
     table_name = get_table_name("pdf_resources")
-    cursor = execute_query(f"DELETE FROM {table_name} WHERE id = ?", (resource_id,))
+    cursor = execute_query(f"DELETE FROM {table_name} WHERE id = %s", (resource_id,))
     cursor.close()
     
     if is_snowflake():
@@ -2140,7 +2140,7 @@ def save_payment_receipt(name: str, email: str, reference: str, filename: str):
     table_name = get_table_name("payment_receipts")
     cursor = execute_query(f"""
         INSERT INTO {table_name} (full_name, email, gcash_reference, receipt_filename, status, submitted_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s)
     """, (name, email, reference, filename, "Pending", datetime.now().isoformat()))
     cursor.close()
     
@@ -3791,7 +3791,7 @@ elif page == "🛠️ Admin Panel":
                 cursor = execute_query(f"""
                     SELECT receipt_filename, full_name, email, status
                     FROM {table_name}
-                    WHERE id = ?
+                    WHERE id = %s
                 """, (receipt_id_view,))
                 receipt_info = cursor.fetchone()
                 cursor.close()
@@ -3836,7 +3836,7 @@ elif page == "🛠️ Admin Panel":
                 cursor = execute_query(f"""
                     SELECT email, full_name
                     FROM {table_name}
-                    WHERE id = ?
+                    WHERE id = %s
                 """, (receipt_id,))
                 receipt_info = cursor.fetchone()
                 cursor.close()
@@ -3844,8 +3844,8 @@ elif page == "🛠️ Admin Panel":
                 # Update receipt status
                 cursor = execute_query(f"""
                     UPDATE {table_name}
-                    SET status = ?, reviewed_at = ?, reviewed_by = ?, notes = ?
-                    WHERE id = ?
+                    SET status = %s, reviewed_at = %s, reviewed_by = %s, notes = %s
+                    WHERE id = %s
                 """, (new_status, datetime.now().isoformat(), "admin", admin_notes, receipt_id))
                 cursor.close()
                 
@@ -3860,7 +3860,7 @@ elif page == "🛠️ Admin Panel":
                     # Determine access level based on payment amount or notes
                     # Check if user exists, create if not
                     table_name = get_table_name("users")
-                    cursor = execute_query(f"SELECT email FROM {table_name} WHERE email = ?", (receipt_email.lower(),))
+                    cursor = execute_query(f"SELECT email FROM {table_name} WHERE email = %s", (receipt_email.lower(),))
                     user_exists = cursor.fetchone()
                     
                     cursor.close()
@@ -3869,7 +3869,7 @@ elif page == "🛠️ Admin Panel":
                         table_name = get_table_name("users")
                         cursor = execute_query(f"""
                             INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin)
-                            VALUES (?, ?, ?, ?, ?, ?)
+                            VALUES (%s, %s, %s, %s, %s, %s)
                         """, (receipt_email.lower(), "Free", 0, datetime.now().isoformat(), datetime.now().isoformat(), 0))
                         cursor.close()
                         if is_snowflake():
@@ -4048,16 +4048,18 @@ elif page == "🛠️ Admin Panel":
                     if new_user_email and "@" in new_user_email and "." in new_user_email.split("@")[1]:
                         # Check if user already exists
                         table_name = get_table_name("users")
-                        cursor = execute_query(f"SELECT email FROM {table_name} WHERE email = ?", (new_user_email.lower(),))
+                        cursor = execute_query(f"SELECT email FROM {table_name} WHERE email = %s", (new_user_email.lower(),))
                         if cursor.fetchone():
                             st.error(f"❌ User with email {new_user_email} already exists.")
                         else:
                             # Create new user
-                            cursor.execute("""
-                                INSERT INTO users (email, access_level, questions_answered, created_at, last_login, is_admin)
-                                VALUES (?, ?, ?, ?, ?, ?)
+                            cursor = execute_query(f"""
+                                INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin)
+                                VALUES (%s, %s, %s, %s, %s, %s)
                             """, (new_user_email.lower(), new_user_access, 0, datetime.now().isoformat(), datetime.now().isoformat(), 0))
-                            db_conn.commit()
+                            cursor.close()
+                            if is_snowflake():
+                                db_conn.commit()
                             get_all_users_cached.clear()
                             st.success(f"✅ User {new_user_email} added with {new_user_access} access!")
                             st.rerun()
