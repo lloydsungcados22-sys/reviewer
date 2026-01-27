@@ -3109,16 +3109,16 @@ elif page == "🧠 Practice Exam":
     )
     
     if not st.session_state.pdf_text:
-        st.info("💡 No document loaded. Default dummy questions will be used for practice.")
+        st.info("💡 No document loaded. Please upload or select documents to generate questions.")
     elif not has_actual_text:
-        # Documents are selected/uploaded but text extraction was limited
+        # Documents are selected/uploaded but text extraction was limited - still allow question generation
         if st.session_state.pdf_text.startswith("SELECTED_DOCUMENTS"):
-            st.info("💡 Documents are selected, but text extraction was limited. Default dummy questions will be used for practice.")
+            st.info("💡 Documents are selected. Question generation will proceed with available text.")
         elif st.session_state.pdf_text == "UPLOADED_DOCUMENT_NO_EXTRACTED_TEXT":
-            st.info("💡 Document uploaded, but text extraction was limited. Default dummy questions will be used for practice.")
+            st.info("💡 Document uploaded. Question generation will proceed with available text.")
         else:
-            st.info("💡 Document loaded, but text extraction was limited. Default dummy questions will be used for practice.")
-    # Allow continuing with dummy questions even if text extraction failed
+            st.info("💡 Document loaded. Question generation will proceed with available text.")
+    # Allow question generation even if text extraction was limited - no dummy fallback
     
     # Check question limit based on user access level
     # Revised tiering: Free (15), Advance (90), Premium (unlimited)
@@ -3255,16 +3255,18 @@ elif page == "🧠 Practice Exam":
                                 max_total_chars=None,  # No limit
                                 progress_callback=update_progress,
                             )
-                            min_chars = 50  # Less strict minimum length
-                            if text_for_generation and len(text_for_generation.strip()) >= min_chars:
+                            # Use any text that was extracted, no minimum requirement
+                            if text_for_generation and text_for_generation.strip():
                                 update_progress(f"✓ Extracted {len(text_for_generation)} characters from {len(selected_paths)} document(s)")
                                 # Update session state to reflect documents are loaded
                                 st.session_state.pdf_text = text_for_generation
                                 st.session_state.pdf_name = f"Combined from {len(selected_paths)} document(s)"
                             else:
-                                update_progress(f"⚠ No sufficient text extracted from documents (need at least {min_chars} characters)")
+                                # No text extracted - will show error below, but mark documents as selected
+                                update_progress(f"⚠ No readable text extracted from documents")
+                                st.session_state.pdf_text = "SELECTED_DOCUMENTS_NO_TEXT"
+                                st.session_state.pdf_name = f"{len(selected_paths)} document(s) selected"
                                 text_for_generation = ""
-                                st.warning(f"⚠ Could not extract sufficient text from selected documents. Please ensure documents contain readable text.")
                         except Exception as e:
                             st.error(f"Error extracting documents: {str(e)}")
                             update_progress(f"❌ Error: {str(e)}")
@@ -3274,12 +3276,25 @@ elif page == "🧠 Practice Exam":
                                 st.code(traceback.format_exc())
                         
                         # Generate questions with AI from selected documents (NO dummy fallback)
-                        min_chars = 50
-                        if not text_for_generation or len(text_for_generation.strip()) < min_chars:
-                            update_progress("❌ No document text available from selected documents.")
+                        # Proceed with question generation if we have any text at all
+                        if not text_for_generation or not text_for_generation.strip():
+                            update_progress("❌ No readable text could be extracted from the selected documents.")
                             progress_container.empty()
-                            st.error("❌ Cannot extract sufficient text from selected documents. Please ensure documents contain readable text.")
+                            st.error("❌ **Cannot generate questions:** No readable text was extracted from your selected documents.")
+                            st.warning("""
+                            **Possible reasons:**
+                            - Documents are scanned/image-based (require OCR)
+                            - Documents are password-protected or encrypted
+                            - Documents contain only images with no text layer
+                            
+                            **Solutions:**
+                            - Try uploading documents with machine-readable text
+                            - Use OCR-enabled documents
+                            - Contact admin for assistance with document processing
+                            """)
+                            st.info("💡 **No dummy questions will be used.** Please fix your documents and try again.")
                         else:
+                            # We have text - proceed with generation
                             update_progress(f"✓ Ready to generate from {len(text_for_generation)} characters of text from selected documents")
                             
                             update_progress("🚀 Starting AI question generation from selected documents...")
