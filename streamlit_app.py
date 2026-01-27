@@ -1466,7 +1466,7 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
         table_name = get_table_name("pdf_resources")
         cursor = execute_query(f"""
             SELECT filepath, filename FROM {table_name} 
-            WHERE uploaded_by = ?
+            WHERE uploaded_by = %s
         """, (user_email.lower(),))
         user_docs = cursor.fetchall()
         cursor.close()
