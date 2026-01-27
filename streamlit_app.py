@@ -2847,16 +2847,20 @@ elif page == "📄 Upload Reviewer":
                         with st.spinner("Extracting text from selected documents..."):
                             try:
                                 combined_text = extract_text_from_documents(selected_paths)
-                                if combined_text and len(combined_text.strip()) >= 10:
+                                if combined_text and combined_text.strip():
                                     st.session_state.pdf_text = combined_text
                                     st.session_state.pdf_name = f"Combined from {selected_count} document(s)"
                                     st.success(f"✅ Loaded content from {selected_count} document(s)!")
                                     with st.expander("📖 Preview (First 1000 characters)"):
                                         st.text(combined_text[:1000] + "..." if len(combined_text) > 1000 else combined_text)
                                     st.metric("Total Characters", f"{len(combined_text):,}")
+
+                                    # If text is very short, warn that AI generation may be limited
+                                    if len(combined_text.strip()) < 50:
+                                        st.warning("⚠️ Only a small amount of text was extracted. AI question generation may be limited.")
                                 else:
-                                    st.warning("⚠️ Preview available, but text extraction was limited. Some documents may be scanned PDFs (image-based) that require OCR for full text extraction.")
-                                    st.info("💡 The documents are available for preview, but AI question generation may be limited. Contact admin if you need OCR-enabled documents.")
+                                    st.warning("⚠️ No machine-readable text could be extracted from the selected documents. They may be scanned/image-based or protected.")
+                                    st.info("💡 The documents are still available in your library, but AI question generation may not work for them.")
                             except Exception as e:
                                 st.warning(f"⚠️ Preview available, but some documents could not be fully processed: {str(e)}")
                                 st.info("💡 Documents are available for viewing. Some may be scanned PDFs that require OCR.")
@@ -2982,16 +2986,24 @@ elif page == "📄 Upload Reviewer":
                         if text:
                             st.session_state.pdf_text = text
                             st.session_state.pdf_name = name
-                            st.success(f"✅ Successfully uploaded and loaded: {name}")
-                            # Also update document selections
-                            if "document_selections" not in st.session_state:
-                                st.session_state.document_selections = {}
-                            st.session_state.document_selections[file_path] = True
+                        else:
+                            # Even if text extraction fails, mark that the user has uploaded a document
+                            # so status shows PDF Loaded = Yes and Practice Exam knows a doc exists.
+                            st.session_state.pdf_text = "UPLOADED_DOCUMENT_NO_EXTRACTED_TEXT"
+                            st.session_state.pdf_name = uploaded_file.name or "Uploaded Document"
 
-                            # Clear cache to refresh document library
-                            get_document_library.clear()
+                        st.success(f"✅ File uploaded and added to your document library: {st.session_state.pdf_name}")
 
-                            # Preview
+                        # Also update document selections
+                        if "document_selections" not in st.session_state:
+                            st.session_state.document_selections = {}
+                        st.session_state.document_selections[file_path] = True
+
+                        # Clear cache to refresh document library
+                        get_document_library.clear()
+
+                        # Preview only when we have actual text
+                        if text:
                             with st.expander("📖 Document Preview (First 1000 characters)"):
                                 st.text(text[:1000] + "..." if len(text) > 1000 else text)
 
@@ -3004,19 +3016,18 @@ elif page == "📄 Upload Reviewer":
                             with col2:
                                 st.metric("Character Count", f"{char_count:,}")
                         else:
-                            # More graceful error handling
-                            st.warning("⚠️ Text extraction was limited or unsuccessful. This file may be:")
+                            # More graceful error handling when no text extracted
+                            st.warning("⚠️ Text extraction was limited or unsuccessful for this file.")
                             st.markdown(
                                 """
-                                - A scanned PDF (image-based) requiring OCR
-                                - A protected/encrypted document
-                                - A file with minimal text content
+                                - It may be a scanned/image-based document requiring OCR
+                                - It may be protected/encrypted
+                                - It may contain very little machine-readable text
                                 """
                             )
                             st.info(
-                                "💡 The file has been uploaded and is available in your document library. "
-                                "You can still use it for preview, but AI question generation may be limited. "
-                                "Contact admin if you need OCR-enabled processing."
+                                "💡 The file has still been uploaded and is available in your document library. "
+                                "You can use it for preview, but AI question generation may be limited."
                             )
     
     st.markdown("---")
