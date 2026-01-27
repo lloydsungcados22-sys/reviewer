@@ -35,6 +35,7 @@ import pandas as pd
 # PDF processing
 fitz_module = None
 pdfplumber_module = None
+OCR_AVAILABLE = False
 try:
     import fitz as fitz_module  # PyMuPDF
     PDF_AVAILABLE = True
@@ -49,6 +50,14 @@ except ImportError:
         PDF_AVAILABLE = False
         PDF_LIB = None
         pdfplumber_module = None
+
+# Optional OCR support for scanned/image-based PDFs
+try:
+    from PIL import Image
+    import pytesseract
+    OCR_AVAILABLE = True
+except Exception:
+    OCR_AVAILABLE = False
 
 # Word document processing
 Document_class = None
@@ -533,6 +542,7 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
         text = ""
         extraction_success = False
         
+        # 1) Try native text extraction first (pdfplumber or PyMuPDF)
         if PDF_LIB == "pdfplumber" and pdfplumber_module:
             # pdfplumber can handle file objects or paths
             try:
@@ -550,7 +560,7 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
                 pass
         
         if not extraction_success and PDF_LIB == "fitz" and fitz_module:
-            # PyMuPDF (fitz) as fallback
+            # PyMuPDF (fitz) as fallback text extractor
             try:
                 if isinstance(pdf_file, str):
                     # File path
@@ -564,18 +574,39 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
                 extraction_success = True
             except Exception as e:
                 pass
+
+        # 2) If still no text and OCR is available, try OCR on rendered pages
+        if (not extraction_success or not text.strip()) and OCR_AVAILABLE and fitz_module:
+            try:
+                if isinstance(pdf_file, str):
+                    doc = fitz_module.open(pdf_file)
+                else:
+                    pdf_file.seek(0)
+                    doc = fitz_module.open(stream=pdf_file.read(), filetype="pdf")
+
+                ocr_chunks = []
+                # Limit OCR to first few pages for performance
+                max_ocr_pages = min(5, len(doc))
+                for page_index in range(max_ocr_pages):
+                    page = doc[page_index]
+                    pix = page.get_pixmap()
+                    mode = "RGB" if pix.alpha == 0 else "RGBA"
+                    img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+                    ocr_text = pytesseract.image_to_string(img)
+                    if ocr_text:
+                        ocr_chunks.append(ocr_text)
+                doc.close()
+                text = "\n".join(ocr_chunks)
+                extraction_success = bool(text.strip())
+            except Exception:
+                pass
         
-        # If still no text extracted, check if it's a scanned PDF
-        if not text or len(text.strip()) < 10:
-            # Might be a scanned PDF (image-based, requires OCR)
-            # Return minimal text to indicate file exists but needs OCR
+        # If still no text extracted, return empty string but keep filename
+        if not text or not text.strip():
             return "", filename
         
-        # Clean text
+        # Clean text and be less strict about length
         text = " ".join(text.split())
-        if len(text.strip()) < 10:
-            # Very little text extracted - likely scanned PDF
-            return "", filename
         
         return text, filename
     except Exception as e:
@@ -2854,77 +2885,139 @@ elif page == "📄 Upload Reviewer":
             st.file_uploader("Choose PDF or Word document", type=["pdf", "docx", "doc"], disabled=True, help="Upgrade to Advance or Premium to unlock document upload")
             uploaded_file = None  # No file upload for Free users
         else:
-            uploaded_file = st.file_uploader("Choose PDF or Word document", type=["pdf", "docx", "doc"], help="Upload your criminology reviewer PDF or Word document", key=f"user_upload_{st.session_state.user_email or 'guest'}")
-            
+            uploaded_file = st.file_uploader(
+                "Choose PDF or Word document",
+                type=["pdf", "docx", "doc"],
+                help="Upload your criminology reviewer PDF or Word document",
+                key=f"user_upload_{st.session_state.user_email or 'guest'}",
+            )
+
             if uploaded_file:
-                # Save to uploads directory with user email in filename
-                uploads_dir = "uploads"
-                os.makedirs(uploads_dir, exist_ok=True)
-                
-                # Generate unique filename with timestamp and user email
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                file_ext = os.path.splitext(uploaded_file.name)[1]
-                user_email_clean = ""
-                if st.session_state.user_logged_in and st.session_state.user_email:
-                    user_email_clean = st.session_state.user_email.lower().replace('@', '_').replace('.', '_') + "_"
-                filename = f"{user_email_clean}{timestamp}_{uploaded_file.name}"
-                file_path = os.path.join(uploads_dir, filename)
-                
-                with open(file_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                
-                # Save to database with user email
-                if st.session_state.user_logged_in and st.session_state.user_email:
-                    try:
-                        save_pdf_resource(filename, file_path, False, True, st.session_state.user_email, f"Uploaded by {st.session_state.user_email}")
-                    except Exception:
-                        pass  # Continue even if database save fails
-                
-                # Extract text
-                file_ext = uploaded_file.name.lower().split('.')[-1] if uploaded_file.name else ""
-                if file_ext == "pdf":
-                    text, name = extract_text_from_pdf(uploaded_file)
-                elif file_ext in ["docx", "doc"]:
-                    uploaded_file.seek(0)  # Reset file pointer
-                    text, name = extract_text_from_docx(uploaded_file)
+                # Avoid re-processing the same file on rerun
+                file_id = f"{uploaded_file.name}_{uploaded_file.size}"
+                last_id = st.session_state.get("last_processed_upload_id")
+                if last_id == file_id:
+                    # Already processed this exact file in this session; skip to prevent upload loop
+                    pass
                 else:
-                    text, name = "", ""
-                
-                if text:
-                    st.session_state.pdf_text = text
-                    st.session_state.pdf_name = name
-                    st.success(f"✅ Successfully uploaded and loaded: {name}")
-                    # Also update document selections
-                    if "document_selections" not in st.session_state:
-                        st.session_state.document_selections = {}
-                    st.session_state.document_selections[file_path] = True
-                    
-                    # Clear cache to refresh document library
-                    get_document_library.clear()
-                    
-                    # Preview
-                    with st.expander("📖 Document Preview (First 1000 characters)"):
-                        st.text(text[:1000] + "..." if len(text) > 1000 else text)
-                    
-                    # Stats
-                    word_count = len(text.split())
-                    char_count = len(text)
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("Word Count", f"{word_count:,}")
-                    with col2:
-                        st.metric("Character Count", f"{char_count:,}")
-                    
-                    st.rerun()
-                else:
-                    # More graceful error handling
-                    st.warning("⚠️ Text extraction was limited or unsuccessful. This file may be:")
-                    st.markdown("""
-                    - A scanned PDF (image-based) requiring OCR
-                    - A protected/encrypted document
-                    - A file with minimal text content
-                    """)
-                    st.info("💡 The file has been uploaded and is available in your document library. You can still use it for preview, but AI question generation may be limited. Contact admin if you need OCR-enabled processing.")
+                    st.session_state.last_processed_upload_id = file_id
+
+                    # Save to uploads directory with user email in filename
+                    uploads_dir = "uploads"
+                    os.makedirs(uploads_dir, exist_ok=True)
+
+                    # Generate unique filename with timestamp and user email
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    file_ext = os.path.splitext(uploaded_file.name)[1]
+                    user_email_clean = ""
+                    if st.session_state.user_logged_in and st.session_state.user_email:
+                        user_email_clean = (
+                            st.session_state.user_email.lower()
+                            .replace("@", "_")
+                            .replace(".", "_")
+                            + "_"
+                        )
+
+                    # Prevent duplicate uploads for the same user and original filename
+                    is_duplicate = False
+                    if st.session_state.user_logged_in and st.session_state.user_email:
+                        try:
+                            table_name = get_table_name("pdf_resources")
+                            cursor = execute_query(
+                                f"""
+                                SELECT COUNT(*)
+                                FROM {table_name}
+                                WHERE uploaded_by = %s
+                                  AND filename LIKE %s
+                                """,
+                                (
+                                    st.session_state.user_email,
+                                    f"%_{uploaded_file.name}",
+                                ),
+                            )
+                            count_row = cursor.fetchone()
+                            cursor.close()
+                            if count_row and count_row[0] > 0:
+                                is_duplicate = True
+                        except Exception:
+                            # If duplicate check fails, fall back to allowing upload
+                            is_duplicate = False
+
+                    if is_duplicate:
+                        st.warning(
+                            "⚠️ This file (same name) has already been uploaded. "
+                            "Please rename the file or upload a different document."
+                        )
+                    else:
+                        filename = f"{user_email_clean}{timestamp}_{uploaded_file.name}"
+                        file_path = os.path.join(uploads_dir, filename)
+
+                        with open(file_path, "wb") as f:
+                            f.write(uploaded_file.getbuffer())
+
+                        # Save to database with user email
+                        if st.session_state.user_logged_in and st.session_state.user_email:
+                            try:
+                                save_pdf_resource(
+                                    filename,
+                                    file_path,
+                                    False,
+                                    True,
+                                    st.session_state.user_email,
+                                    f"Uploaded by {st.session_state.user_email}",
+                                )
+                            except Exception:
+                                pass  # Continue even if database save fails
+
+                        # Extract text
+                        file_ext = uploaded_file.name.lower().split(".")[-1] if uploaded_file.name else ""
+                        if file_ext == "pdf":
+                            text, name = extract_text_from_pdf(uploaded_file)
+                        elif file_ext in ["docx", "doc"]:
+                            uploaded_file.seek(0)  # Reset file pointer
+                            text, name = extract_text_from_docx(uploaded_file)
+                        else:
+                            text, name = "", ""
+
+                        if text:
+                            st.session_state.pdf_text = text
+                            st.session_state.pdf_name = name
+                            st.success(f"✅ Successfully uploaded and loaded: {name}")
+                            # Also update document selections
+                            if "document_selections" not in st.session_state:
+                                st.session_state.document_selections = {}
+                            st.session_state.document_selections[file_path] = True
+
+                            # Clear cache to refresh document library
+                            get_document_library.clear()
+
+                            # Preview
+                            with st.expander("📖 Document Preview (First 1000 characters)"):
+                                st.text(text[:1000] + "..." if len(text) > 1000 else text)
+
+                            # Stats
+                            word_count = len(text.split())
+                            char_count = len(text)
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.metric("Word Count", f"{word_count:,}")
+                            with col2:
+                                st.metric("Character Count", f"{char_count:,}")
+                        else:
+                            # More graceful error handling
+                            st.warning("⚠️ Text extraction was limited or unsuccessful. This file may be:")
+                            st.markdown(
+                                """
+                                - A scanned PDF (image-based) requiring OCR
+                                - A protected/encrypted document
+                                - A file with minimal text content
+                                """
+                            )
+                            st.info(
+                                "💡 The file has been uploaded and is available in your document library. "
+                                "You can still use it for preview, but AI question generation may be limited. "
+                                "Contact admin if you need OCR-enabled processing."
+                            )
     
     st.markdown("---")
     
@@ -3107,14 +3200,20 @@ elif page == "🧠 Practice Exam":
                         # Extract text from selected documents
                         update_progress(f"📄 Reading {len(selected_paths)} selected document(s)...")
                         try:
-                            text_for_generation = extract_text_from_documents(selected_paths, max_pages_per_doc=50, max_total_chars=50000, progress_callback=update_progress)
-                            if text_for_generation and len(text_for_generation.strip()) >= 100:
+                            text_for_generation = extract_text_from_documents(
+                                selected_paths,
+                                max_pages_per_doc=50,
+                                max_total_chars=50000,
+                                progress_callback=update_progress,
+                            )
+                            min_chars = 50  # Less strict minimum length
+                            if text_for_generation and len(text_for_generation.strip()) >= min_chars:
                                 update_progress(f"✓ Extracted {len(text_for_generation)} characters from {len(selected_paths)} document(s)")
                                 # Update session state to reflect documents are loaded
                                 st.session_state.pdf_text = text_for_generation
                                 st.session_state.pdf_name = f"Combined from {len(selected_paths)} document(s)"
                             else:
-                                update_progress("⚠ No sufficient text extracted from documents (need at least 100 characters)")
+                                update_progress(f"⚠ No sufficient text extracted from documents (need at least {min_chars} characters)")
                                 text_for_generation = ""
                                 st.warning(f"⚠ Could not extract sufficient text from selected documents. Please ensure documents contain readable text.")
                         except Exception as e:
@@ -3126,7 +3225,8 @@ elif page == "🧠 Practice Exam":
                                 st.code(traceback.format_exc())
                         
                         # Generate questions with AI from selected documents (NO dummy fallback)
-                        if not text_for_generation or len(text_for_generation.strip()) < 100:
+                        min_chars = 50
+                        if not text_for_generation or len(text_for_generation.strip()) < min_chars:
                             update_progress("❌ No document text available from selected documents.")
                             progress_container.empty()
                             st.error("❌ Cannot extract sufficient text from selected documents. Please ensure documents contain readable text.")
@@ -3902,7 +4002,40 @@ elif page == "🛠️ Admin Panel":
     
     with tab4:
         st.markdown("### 📄 PDF Resource Management")
-        
+
+        # Admin reset: remove all documents and start fresh
+        with st.expander("🧹 Reset Document Library (Danger Zone)"):
+            st.warning(
+                "This will delete **all** PDF records and uploaded files from the server. "
+                "Use only if you want to completely reset the document library."
+            )
+            confirm_reset = st.checkbox("I understand this will permanently delete all documents.", key="confirm_reset_docs")
+            if st.button("🧹 Delete All Documents", type="secondary", disabled=not confirm_reset):
+                try:
+                    # Delete all rows from pdf_resources table
+                    table_name = get_table_name("pdf_resources")
+                    cursor = execute_query(f"DELETE FROM {table_name}")
+                    cursor.close()
+                    if is_snowflake():
+                        db_conn.commit()
+
+                    # Remove files from admin_docs and uploads directories
+                    for folder in ["admin_docs", "uploads"]:
+                        if os.path.exists(folder):
+                            for fname in os.listdir(folder):
+                                fpath = os.path.join(folder, fname)
+                                try:
+                                    if os.path.isfile(fpath):
+                                        os.remove(fpath)
+                                except Exception:
+                                    pass
+                    get_pdf_resources.clear()
+                    get_document_library.clear()
+                    st.success("✅ Document library reset. All documents have been removed.")
+                    st.experimental_rerun()
+                except Exception as e:
+                    st.error(f"❌ Failed to reset document library: {str(e)}")
+
         # Upload new PDF
         st.markdown("#### 📤 Upload New PDF")
         with st.form("upload_pdf_admin_tab4"):
@@ -3949,72 +4082,55 @@ elif page == "🛠️ Admin Panel":
                     with col2:
                         premium_toggle = st.checkbox("Premium Only", value=pdf['is_premium_only'], key=f"premium_{pdf['id']}")
                         ai_toggle = st.checkbox("Use for AI", value=pdf['use_for_ai_generation'], key=f"ai_{pdf['id']}")
-                        downloadable_toggle = st.checkbox("Allow Download", value=pdf.get('is_downloadable', True), key=f"download_{pdf['id']}", help="✅ Downloadable: Users can download | ❌ Preview-only: Users can only preview")
-                        
+                        downloadable_toggle = st.checkbox(
+                            "Allow Download",
+                            value=pdf.get('is_downloadable', True),
+                            key=f"download_{pdf['id']}",
+                            help="✅ Downloadable: Users can download | ❌ Preview-only: Users can only preview",
+                        )
+
                         if st.button("💾 Update Settings", key=f"update_{pdf['id']}", use_container_width=True):
                             table_name = get_table_name("pdf_resources")
                             # Check if is_downloadable column exists
                             columns = get_table_columns("pdf_resources")
                             has_downloadable = 'is_downloadable' in columns
-                            
+
                             if has_downloadable:
                                 cursor = execute_query(f"""
                                     UPDATE {table_name}
-                                    SET is_premium_only = ?, use_for_ai_generation = ?, is_downloadable = ?
-                                    WHERE id = ?
+                                    SET is_premium_only = %s, use_for_ai_generation = %s, is_downloadable = %s
+                                    WHERE id = %s
                                 """, (1 if premium_toggle else 0, 1 if ai_toggle else 0, 1 if downloadable_toggle else 0, pdf['id']))
                             else:
                                 cursor = execute_query(f"""
                                     UPDATE {table_name}
-                                    SET is_premium_only = ?, use_for_ai_generation = ?
-                                    WHERE id = ?
+                                    SET is_premium_only = %s, use_for_ai_generation = %s
+                                    WHERE id = %s
                                 """, (1 if premium_toggle else 0, 1 if ai_toggle else 0, pdf['id']))
                             cursor.close()
-                            
+
                             if is_snowflake():
                                 db_conn.commit()
                             get_pdf_resources.clear()  # Clear cache
                             get_document_library.clear()  # Clear cache
                             st.success(f"✅ Settings updated for {pdf['filename']}")
-                            st.rerun()
-                        ai_toggle = st.checkbox("Use for AI", value=pdf['use_for_ai_generation'], key=f"ai_{pdf['id']}")
-                        
-                        downloadable_toggle = st.checkbox("Allow Download", value=pdf.get('is_downloadable', True), key=f"download_{pdf['id']}", help="✅ Downloadable: Users can download | ❌ Preview-only: Users can only preview")
-                        
-                        if st.button("💾 Update Settings", key=f"update_{pdf['id']}", use_container_width=True):
-                            table_name = get_table_name("pdf_resources")
-                            # Check if is_downloadable column exists
-                            columns = get_table_columns("pdf_resources")
-                            has_downloadable = 'is_downloadable' in columns
-                            
-                            if has_downloadable:
-                                cursor = execute_query(f"""
-                                    UPDATE {table_name}
-                                    SET is_premium_only = ?, use_for_ai_generation = ?, is_downloadable = ?
-                                    WHERE id = ?
-                                """, (1 if premium_toggle else 0, 1 if ai_toggle else 0, 1 if downloadable_toggle else 0, pdf['id']))
-                            else:
-                                cursor = execute_query(f"""
-                                    UPDATE {table_name}
-                                    SET is_premium_only = ?, use_for_ai_generation = ?
-                                    WHERE id = ?
-                                """, (1 if premium_toggle else 0, 1 if ai_toggle else 0, pdf['id']))
-                            cursor.close()
-                            
-                            if is_snowflake():
-                                db_conn.commit()
-                            get_pdf_resources.clear()  # Clear cache
-                            get_document_library.clear()  # Clear cache
-                            st.success(f"✅ Settings updated for {pdf['filename']}")
-                            st.rerun()
-                            st.success("✅ Updated!")
                             st.rerun()
                         
                         if st.button("🗑️ Delete", key=f"delete_{pdf['id']}"):
-                            if os.path.exists(pdf['filepath']):
-                                os.remove(pdf['filepath'])
+                            # Delete file from disk if present
+                            if pdf.get('filepath') and os.path.exists(pdf['filepath']):
+                                try:
+                                    os.remove(pdf['filepath'])
+                                except Exception as e:
+                                    st.warning(f"⚠️ File could not be removed from disk: {e}")
+                            # Delete record from database
                             delete_pdf_resource(pdf['id'])
-                            st.success("✅ Deleted!")
+                            if is_snowflake():
+                                db_conn.commit()
+                            # Clear caches and confirm
+                            get_pdf_resources.clear()
+                            get_document_library.clear()
+                            st.success("✅ PDF deleted from library.")
                             st.rerun()
         else:
             st.info("No PDFs uploaded yet.")
