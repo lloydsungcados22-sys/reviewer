@@ -4077,7 +4077,15 @@ elif page == "🛠️ Admin Panel":
         
         if users_data:
             st.markdown("#### 📊 All Users")
-            df = pd.DataFrame(users_data, columns=["Email", "Access Level", "Questions Answered", "Created At", "Last Login"])
+            # Build DataFrame from dict keys, then use friendly column titles
+            df = pd.DataFrame(users_data)
+            df = df.rename(columns={
+                "email": "Email",
+                "access_level": "Access Level",
+                "questions_answered": "Questions Answered",
+                "created_at": "Created At",
+                "last_login": "Last Login",
+            })
             
             # Search
             search_email = st.text_input("🔍 Search User by Email", placeholder="Enter email to search")
