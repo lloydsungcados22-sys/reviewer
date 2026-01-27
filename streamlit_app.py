@@ -855,11 +855,11 @@ Return ONLY a valid JSON array with EXACTLY {num_questions} question objects. Do
 """
         
         if progress_callback:
-            progress_callback("🤖 Sending request to OpenAI API...")
+            progress_callback("AI agent is generating questions based on your uploaded files. Please wait 30–60 seconds.")
         
         try:
             if progress_callback:
-                progress_callback("🤖 Sending request to OpenAI API (this may take 30-60 seconds)...")
+                progress_callback("AI agent is generating questions based on your uploaded files. Please wait 30–60 seconds.")
             # Make API call with explicit parameters
             # Note: timeout is set at client level, not in create() call
             response = client.chat.completions.create(
@@ -1550,14 +1550,15 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
     
     return documents
 
-def extract_text_from_documents(document_paths: List[str], max_pages_per_doc: int = 50, max_total_chars: int = 50000, progress_callback=None) -> str:
-    """Extract and combine text from multiple documents with limits"""
+def extract_text_from_documents(document_paths: List[str], max_pages_per_doc: int = None, max_total_chars: int = None, progress_callback=None) -> str:
+    """Extract and combine text from multiple documents (no limits)"""
     combined_text = []
     total_chars = 0
     
     for idx, doc_path in enumerate(document_paths):
-        if total_chars >= max_total_chars:
-            break
+        # Remove character limit check - process all documents fully
+        # if max_total_chars and total_chars >= max_total_chars:
+        #     break
             
         if not os.path.exists(doc_path):
             if progress_callback:
@@ -1572,9 +1573,7 @@ def extract_text_from_documents(document_paths: List[str], max_pages_per_doc: in
                 if PDF_AVAILABLE:
                     text, _ = extract_text_from_pdf(doc_path)
                     if text:
-                        # Limit pages/chars per document
-                        if len(text) > max_pages_per_doc * 1000:  # Rough estimate
-                            text = text[:max_pages_per_doc * 1000]
+                        # No character limit - extract full document
                         combined_text.append(text)
                         total_chars += len(text)
                         if progress_callback:
@@ -1586,8 +1585,7 @@ def extract_text_from_documents(document_paths: List[str], max_pages_per_doc: in
                 if DOCX_AVAILABLE:
                     text, _ = extract_text_from_docx(doc_path)
                     if text:
-                        if len(text) > max_pages_per_doc * 1000:
-                            text = text[:max_pages_per_doc * 1000]
+                        # No character limit - extract full document
                         combined_text.append(text)
                         total_chars += len(text)
                         if progress_callback:
@@ -2764,9 +2762,21 @@ elif page == "📄 Upload Reviewer":
         else:
             # Initialize selected documents in session state
             if "document_selections" not in st.session_state:
-                st.session_state.document_selections = {doc['filepath']: True for doc in all_documents}
+                st.session_state.document_selections = {}
             
-            selected_count = sum(1 for selected in st.session_state.document_selections.values() if selected)
+            # Ensure all current documents are in the selections dictionary
+            for doc in all_documents:
+                if doc['filepath'] not in st.session_state.document_selections:
+                    st.session_state.document_selections[doc['filepath']] = True  # Default to selected
+            
+            # Remove selections for documents that no longer exist
+            existing_paths = {doc['filepath'] for doc in all_documents}
+            st.session_state.document_selections = {
+                path: selected for path, selected in st.session_state.document_selections.items()
+                if path in existing_paths
+            }
+            
+            selected_count = sum(1 for path, selected in st.session_state.document_selections.items() if selected and path in existing_paths)
             
             col1, col2 = st.columns([3, 1])
             with col1:
@@ -2841,6 +2851,13 @@ elif page == "📄 Upload Reviewer":
             
             # Preview combined text from selected documents
             if selected_count > 0:
+                # Mark documents as loaded even before preview (so status shows "Yes")
+                if not st.session_state.pdf_text or st.session_state.pdf_text == "UPLOADED_DOCUMENT_NO_EXTRACTED_TEXT":
+                    selected_doc_names = [doc['filename'] for doc in all_documents if st.session_state.document_selections.get(doc['filepath'], False)]
+                    if selected_doc_names:
+                        st.session_state.pdf_text = "SELECTED_DOCUMENTS_LOADED"
+                        st.session_state.pdf_name = f"{selected_count} document(s) selected"
+                
                 if st.button("🔍 Preview Selected Documents", use_container_width=True):
                     selected_paths = [doc['filepath'] for doc in all_documents if st.session_state.document_selections.get(doc['filepath'], False)]
                     if selected_paths:
@@ -2859,9 +2876,15 @@ elif page == "📄 Upload Reviewer":
                                     if len(combined_text.strip()) < 50:
                                         st.warning("⚠️ Only a small amount of text was extracted. AI question generation may be limited.")
                                 else:
+                                    # Even if extraction fails, mark documents as selected/loaded
+                                    st.session_state.pdf_text = "SELECTED_DOCUMENTS_NO_TEXT"
+                                    st.session_state.pdf_name = f"{selected_count} document(s) selected (text extraction limited)"
                                     st.warning("⚠️ No machine-readable text could be extracted from the selected documents. They may be scanned/image-based or protected.")
                                     st.info("💡 The documents are still available in your library, but AI question generation may not work for them.")
                             except Exception as e:
+                                # Even on error, mark documents as selected
+                                st.session_state.pdf_text = "SELECTED_DOCUMENTS_ERROR"
+                                st.session_state.pdf_name = f"{selected_count} document(s) selected"
                                 st.warning(f"⚠️ Preview available, but some documents could not be fully processed: {str(e)}")
                                 st.info("💡 Documents are available for viewing. Some may be scanned PDFs that require OCR.")
     
@@ -3078,9 +3101,24 @@ elif page == "🧠 Practice Exam":
         st.stop()  # Stop here until user resumes or starts new
     
     # Check if PDF is loaded or default questions enabled
+    # Documents are considered "loaded" if pdf_text exists (even if it's a placeholder)
+    has_actual_text = (
+        st.session_state.pdf_text and 
+        st.session_state.pdf_text not in ["", "DEFAULT_DUMMY_QUESTIONS"] and
+        st.session_state.pdf_text not in ["SELECTED_DOCUMENTS_LOADED", "SELECTED_DOCUMENTS_NO_TEXT", "SELECTED_DOCUMENTS_ERROR", "UPLOADED_DOCUMENT_NO_EXTRACTED_TEXT"]
+    )
+    
     if not st.session_state.pdf_text:
         st.info("💡 No document loaded. Default dummy questions will be used for practice.")
-        # Allow continuing with dummy questions
+    elif not has_actual_text:
+        # Documents are selected/uploaded but text extraction was limited
+        if st.session_state.pdf_text.startswith("SELECTED_DOCUMENTS"):
+            st.info("💡 Documents are selected, but text extraction was limited. Default dummy questions will be used for practice.")
+        elif st.session_state.pdf_text == "UPLOADED_DOCUMENT_NO_EXTRACTED_TEXT":
+            st.info("💡 Document uploaded, but text extraction was limited. Default dummy questions will be used for practice.")
+        else:
+            st.info("💡 Document loaded, but text extraction was limited. Default dummy questions will be used for practice.")
+    # Allow continuing with dummy questions even if text extraction failed
     
     # Check question limit based on user access level
     # Revised tiering: Free (15), Advance (90), Premium (unlimited)
@@ -3213,8 +3251,8 @@ elif page == "🧠 Practice Exam":
                         try:
                             text_for_generation = extract_text_from_documents(
                                 selected_paths,
-                                max_pages_per_doc=50,
-                                max_total_chars=50000,
+                                max_pages_per_doc=None,  # No limit
+                                max_total_chars=None,  # No limit
                                 progress_callback=update_progress,
                             )
                             min_chars = 50  # Less strict minimum length
