@@ -13,7 +13,6 @@ Features:
 """
 
 import os
-import sqlite3
 import hashlib
 import secrets
 import string
@@ -23,6 +22,14 @@ import json
 import io
 
 import streamlit as st
+
+# Snowflake connector
+try:
+    import snowflake.connector
+    SNOWFLAKE_AVAILABLE = True
+except ImportError:
+    SNOWFLAKE_AVAILABLE = False
+    st.warning("⚠️ Snowflake connector not installed. Install with: pip install snowflake-connector-python")
 import pandas as pd
 
 # PDF processing
@@ -89,104 +96,346 @@ GCASH_NAME = "M**K L***D S."
 RECEIPT_EMAIL = "criminologysupp@gmail.com"
 
 # ============================================================================
-# DATABASE SETUP
+# DATABASE SETUP - SNOWFLAKE
 # ============================================================================
 
-def init_database():
-    """Initialize SQLite database for codes and receipts"""
-    db_path = os.path.join("data", "reviewer.db")
-    os.makedirs("data", exist_ok=True)
-    
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    cursor = conn.cursor()
-    
-    # Premium codes table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS premium_codes (
-            code TEXT PRIMARY KEY,
-            status TEXT DEFAULT 'active',
-            expiry_date TEXT,
-            max_uses INTEGER DEFAULT 1,
-            uses_left INTEGER DEFAULT 1,
-            created_at TEXT,
-            created_by TEXT
-        )
-    """)
-    
-    # Add access_level column if it doesn't exist (for existing databases)
-    cursor.execute("PRAGMA table_info(premium_codes)")
-    columns = [col[1] for col in cursor.fetchall()]
-    if 'access_level' not in columns:
-        try:
-            cursor.execute("ALTER TABLE premium_codes ADD COLUMN access_level TEXT DEFAULT 'Premium'")
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass  # Column might have been added by another process
-    
-    # Code usage tracking
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS code_usage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT,
-            used_at TEXT,
-            session_id TEXT,
-            FOREIGN KEY (code) REFERENCES premium_codes(code)
-        )
-    """)
-    
-    # Payment receipts table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS payment_receipts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            full_name TEXT,
-            email TEXT,
-            gcash_reference TEXT,
-            receipt_filename TEXT,
-            status TEXT DEFAULT 'Pending',
-            submitted_at TEXT,
-            reviewed_at TEXT,
-            reviewed_by TEXT,
-            notes TEXT
-        )
-    """)
-    
-    # Users table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            email TEXT PRIMARY KEY,
-            access_level TEXT DEFAULT 'Free',
-            questions_answered INTEGER DEFAULT 0,
-            created_at TEXT,
-            last_login TEXT,
-            premium_code_used TEXT,
-            is_admin INTEGER DEFAULT 0
-        )
-    """)
-    
-    # PDF management table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS pdf_resources (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            filename TEXT,
-            filepath TEXT,
-            is_premium_only INTEGER DEFAULT 0,
-            use_for_ai_generation INTEGER DEFAULT 1,
-            uploaded_at TEXT,
-            uploaded_by TEXT,
-            description TEXT
-        )
-    """)
-    
-    conn.commit()
-    return conn
+def get_snowflake_config():
+    """Get Snowflake configuration from secrets.toml"""
+    try:
+        snowflake_config = st.secrets["SNOWFLAKE"]
+        # Get password and authenticator
+        password = snowflake_config.get("password", "")
+        authenticator = snowflake_config.get("authenticator", "")
+        # If password is provided but no authenticator specified, omit authenticator (defaults to password auth)
+        # If no password and no authenticator, default to externalbrowser
+        if not password and not authenticator:
+            authenticator = "externalbrowser"
+        
+        return {
+            "account": snowflake_config.get("account", ""),
+            "user": snowflake_config.get("user", ""),
+            "password": password,
+            "authenticator": authenticator,  # Will be empty string if password auth (omit from conn_params)
+            "role": snowflake_config.get("role", ""),
+            "warehouse": snowflake_config.get("warehouse", ""),
+            "database": snowflake_config.get("database", ""),
+            "schema": snowflake_config.get("schema", "")
+        }
+    except Exception as e:
+        st.error(f"❌ Error loading Snowflake configuration: {str(e)}")
+        return None
 
-# Initialize database (cached connection)
 @st.cache_resource
-def get_db_connection():
-    """Get cached database connection"""
-    return init_database()
+def get_snowflake_connection():
+    """Get cached Snowflake database connection"""
+    if not SNOWFLAKE_AVAILABLE:
+        st.error("❌ snowflake-connector-python is not installed. Please install it: pip install snowflake-connector-python")
+        st.stop()
+        return None
+    
+    config = get_snowflake_config()
+    if not config:
+        st.error("❌ Snowflake configuration not found in secrets.toml. Please configure [SNOWFLAKE] section.")
+        st.stop()
+        return None
+    
+    try:
+        # Extract account locator from full account identifier
+        account = config["account"].strip()
+        # Remove any domain suffix if present (e.g., .snowflakecomputing.com)
+        if '.' in account:
+            account = account.split('.')[0]
+        
+        # For SSO/SAML accounts, ensure account format is correct
+        # Account should be in format: orgname-accountname (dash-separated, not dot-separated)
+        # The account "TOJPYBV-JF89768" looks correct already
+        
+        # Build connection parameters
+        conn_params = {
+            "account": account,
+            "user": config["user"].strip(),
+        }
+        
+        # Add password if provided (for password authentication)
+        if config.get("password") and config["password"].strip():
+            conn_params["password"] = config["password"].strip()
+            # When password is provided, don't include authenticator (defaults to password auth)
+        else:
+            # Only include authenticator if explicitly set, otherwise default to externalbrowser
+            authenticator = config.get("authenticator", "").strip()
+            if authenticator:
+                conn_params["authenticator"] = authenticator
+            else:
+                conn_params["authenticator"] = "externalbrowser"
+        
+        # Add optional parameters only if they are provided and not empty
+        if config.get("role") and config["role"].strip() and config["role"] != "<none selected>":
+            conn_params["role"] = config["role"].strip()
+        if config.get("warehouse") and config["warehouse"].strip() and config["warehouse"] != "<none selected>":
+            conn_params["warehouse"] = config["warehouse"].strip()
+        if config.get("database") and config["database"].strip():
+            conn_params["database"] = config["database"].strip()
+        if config.get("schema") and config["schema"].strip():
+            conn_params["schema"] = config["schema"].strip()
+        
+        # Clear any proxy-related environment variables that might interfere
+        import os
+        proxy_vars = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy']
+        for var in proxy_vars:
+            if var in os.environ:
+                del os.environ[var]
+        
+        conn = snowflake.connector.connect(**conn_params)
+        return conn
+    except Exception as e:
+        error_msg = str(e)
+        st.error(f"❌ Error connecting to Snowflake: {error_msg}")
+        st.error("⚠️ **Critical:** Snowflake connection is required. SQLite fallback is disabled.")
+        
+        # Provide specific troubleshooting based on error
+        if "SAML" in error_msg or "Identity Provider" in error_msg:
+            st.error("""
+            **SAML/Identity Provider Error Detected:**
+            
+            This error typically occurs when:
+            1. The account format is incorrect for SSO/SAML authentication
+            2. SSO/SAML authentication is required but not properly configured
+            3. The authenticator type doesn't match your account setup
+            
+            **Solutions:**
+            1. **Verify Account Format**: The account in secrets.toml should be in format `orgname-accountname` (dash-separated).
+               Current value: `{account}`
+            
+            2. **For externalbrowser authenticator**:
+               - Ensure you have browser access and can authenticate via browser
+               - The first connection may require manual browser authentication
+               - Check if your organization requires SSO/SAML login
+            
+            3. **Alternative Authentication Methods**:
+               - If you have a password, try changing `authenticator = "password"` in secrets.toml and add `password = "your_password"`
+               - Contact your Snowflake administrator to verify SSO/SAML configuration
+               - Ask your admin if the account requires a different authentication method
+            
+            4. **Account Identifier Format**:
+               - For SSO accounts, sometimes the account needs to be in a specific format
+               - Verify with your Snowflake admin the correct account identifier for programmatic access
+            """.format(account=config.get("account", "N/A")))
+        elif "Failed to connect" in error_msg:
+            st.error("""
+            **Connection Failed:**
+            
+            Possible causes:
+            1. Network/firewall blocking Snowflake access
+            2. Incorrect account identifier
+            3. Snowflake service unavailable
+            
+            **Solutions:**
+            - Verify account identifier format in secrets.toml
+            - Check network connectivity to Snowflake
+            - Try connecting from Snowflake web interface to verify credentials
+            """)
+        
+        st.stop()
+        return None
 
-db_conn = get_db_connection()
+def init_snowflake_tables():
+    """Initialize Snowflake tables if they don't exist"""
+    # Use the global connection instead of creating a new one
+    if not snowflake_conn:
+        return False
+    conn = snowflake_conn
+    
+    try:
+        cursor = conn.cursor()
+        
+        # Use the configured schema
+        config = get_snowflake_config()
+        database = config["database"] if config else "REVIEWER"
+        schema = config["schema"] if config else "PUBLIC"
+        
+        # Try to use the database and schema
+        try:
+            cursor.execute(f"USE DATABASE {database}")
+        except Exception as e:
+            st.warning(f"⚠️ Could not switch to database {database}: {str(e)}")
+        
+        # NOTE: We intentionally do NOT try to CREATE SCHEMA here.
+        # Many managed Snowflake roles (like learning/demo roles) do not have
+        # permission to create schemas, only to use existing ones.
+        # We assume the target schema already exists and simply try to use it.
+
+        # Try to use the schema directly
+        try:
+            cursor.execute(f"USE SCHEMA {database}.{schema}")
+        except Exception as use_error:
+            st.error(f"❌ Cannot use schema {schema} in database {database}")
+            st.error(f"Error: {str(use_error)}")
+            st.error("""
+            **Schema Access Error:**
+            
+            Your role `SNOWFLAKE_LEARNING_ROLE` does not have permissions to use the schema `{schema}`.
+            
+            **Solutions:**
+            1. **Ask your Snowflake administrator to grant permissions:**
+               ```sql
+               GRANT USAGE ON SCHEMA {database}.{schema} TO ROLE SNOWFLAKE_LEARNING_ROLE;
+               GRANT CREATE TABLE ON SCHEMA {database}.{schema} TO ROLE SNOWFLAKE_LEARNING_ROLE;
+               ```
+            
+            2. **Or use a different schema** that you have access to:
+               - Update `schema = "YOUR_SCHEMA_NAME"` in `.streamlit/secrets.toml`
+               - Common options: `PUBLIC`, or a custom schema name
+            
+            3. **Or create a new schema** (if you have permission):
+               ```sql
+               CREATE SCHEMA {database}.REVIEWER_SCHEMA;
+               GRANT USAGE ON SCHEMA {database}.REVIEWER_SCHEMA TO ROLE SNOWFLAKE_LEARNING_ROLE;
+               GRANT CREATE TABLE ON SCHEMA {database}.REVIEWER_SCHEMA TO ROLE SNOWFLAKE_LEARNING_ROLE;
+               ```
+               Then update `secrets.toml` with `schema = "REVIEWER_SCHEMA"`
+            """.format(schema=schema, database=database))
+            cursor.close()
+            return False
+        
+        # After USE SCHEMA, we can reference tables without schema prefix
+        # Premium codes table
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS premium_codes (
+                code VARCHAR(255) PRIMARY KEY,
+                status VARCHAR(50) DEFAULT 'active',
+                expiry_date VARCHAR(50),
+                max_uses INTEGER DEFAULT 1,
+                uses_left INTEGER DEFAULT 1,
+                created_at VARCHAR(50),
+                created_by VARCHAR(255),
+                access_level VARCHAR(50) DEFAULT 'Premium'
+            )
+        """)
+        
+        # Code usage tracking
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS code_usage (
+                id INTEGER AUTOINCREMENT PRIMARY KEY,
+                code VARCHAR(255),
+                used_at VARCHAR(50),
+                session_id VARCHAR(255),
+                FOREIGN KEY (code) REFERENCES premium_codes(code)
+            )
+        """)
+        
+        # Payment receipts table
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS payment_receipts (
+                id INTEGER AUTOINCREMENT PRIMARY KEY,
+                full_name VARCHAR(255),
+                email VARCHAR(255),
+                gcash_reference VARCHAR(255),
+                receipt_filename VARCHAR(500),
+                status VARCHAR(50) DEFAULT 'Pending',
+                submitted_at VARCHAR(50),
+                reviewed_at VARCHAR(50),
+                reviewed_by VARCHAR(255),
+                notes VARCHAR(2000)
+            )
+        """)
+        
+        # Users table
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS users (
+                email VARCHAR(255) PRIMARY KEY,
+                access_level VARCHAR(50) DEFAULT 'Free',
+                questions_answered INTEGER DEFAULT 0,
+                created_at VARCHAR(50),
+                last_login VARCHAR(50),
+                premium_code_used VARCHAR(255),
+                is_admin INTEGER DEFAULT 0
+            )
+        """)
+        
+        # PDF management table
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS pdf_resources (
+                id INTEGER AUTOINCREMENT PRIMARY KEY,
+                filename VARCHAR(500),
+                filepath VARCHAR(1000),
+                is_premium_only INTEGER DEFAULT 0,
+                use_for_ai_generation INTEGER DEFAULT 1,
+                uploaded_at VARCHAR(50),
+                uploaded_by VARCHAR(255),
+                description VARCHAR(2000),
+                is_downloadable INTEGER DEFAULT 1
+            )
+        """)
+        
+        cursor.close()
+        return True
+    except Exception as e:
+        st.error(f"❌ Error initializing Snowflake tables: {str(e)}")
+        return False
+
+# Helper functions for database operations
+def is_snowflake():
+    """Check if using Snowflake database"""
+    return snowflake_conn is not None
+
+def get_table_name(table: str) -> str:
+    """Get table name with schema prefix if using Snowflake"""
+    if is_snowflake():
+        config = get_snowflake_config()
+        schema = config["schema"] if config else "PUBLIC"
+        return f"{schema}.{table}"
+    return table
+
+def execute_query(query: str, params: tuple = None):
+    """Execute query with proper handling for Snowflake"""
+    if not db_conn:
+        st.error("❌ Database connection not available. Snowflake connection required.")
+        st.stop()
+        return None
+    
+    cursor = db_conn.cursor()
+    try:
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        # Snowflake doesn't need explicit commit for DDL, but we'll commit for DML
+        if query.strip().upper().startswith(('INSERT', 'UPDATE', 'DELETE')):
+            db_conn.commit()
+        return cursor
+    except Exception as e:
+        # Log error but don't rollback (Snowflake handles transactions differently)
+        raise e
+
+def get_table_columns(table: str) -> List[str]:
+    """Get column names for a table"""
+    if is_snowflake():
+        config = get_snowflake_config()
+        schema = config["schema"] if config else "PUBLIC"
+        cursor = db_conn.cursor()
+        cursor.execute(f"SHOW COLUMNS IN TABLE {schema}.{table}")
+        columns = [row[2] for row in cursor.fetchall()]  # Column name is in position 2
+        cursor.close()
+        return columns
+    else:
+        # Should never reach here since SQLite fallback is removed
+        st.error("❌ Database connection error: SQLite fallback is disabled. Snowflake connection required.")
+        return []
+
+# Initialize Snowflake connection and tables - REQUIRED, NO FALLBACK
+snowflake_conn = get_snowflake_connection()
+if not snowflake_conn:
+    st.error("❌ **CRITICAL ERROR:** Cannot connect to Snowflake database. The application requires Snowflake to function.")
+    st.error("Please fix the Snowflake connection configuration in secrets.toml and restart the app.")
+    st.stop()
+
+# Initialize tables
+if not init_snowflake_tables():
+    st.error("❌ **CRITICAL ERROR:** Failed to initialize Snowflake tables. Please check your database permissions.")
+    st.stop()
+
+# Set database connection - Snowflake only, no fallback
+db_conn = snowflake_conn
 
 # ============================================================================
 # SESSION STATE INITIALIZATION
@@ -268,7 +517,7 @@ def extract_text_from_docx(docx_file) -> Tuple[str, str]:
         return "", ""
 
 def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
-    """Extract text from PDF file"""
+    """Extract text from PDF file with improved error handling"""
     try:
         if not PDF_AVAILABLE:
             return "", ""
@@ -281,36 +530,57 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
         else:
             filename = "unknown.pdf"
         
+        text = ""
+        extraction_success = False
+        
         if PDF_LIB == "pdfplumber" and pdfplumber_module:
             # pdfplumber can handle file objects or paths
-            if isinstance(pdf_file, str):
-                with pdfplumber_module.open(pdf_file) as pdf:
-                    text = "\n".join([page.extract_text() or "" for page in pdf.pages])
-            else:
-                # File object - need to reset position
-                pdf_file.seek(0)
-                with pdfplumber_module.open(pdf_file) as pdf:
-                    text = "\n".join([page.extract_text() or "" for page in pdf.pages])
-        elif PDF_LIB == "fitz" and fitz_module:
-            # PyMuPDF (fitz)
-            if isinstance(pdf_file, str):
-                # File path
-                pdf_doc = fitz_module.open(pdf_file)
-            else:
-                # File object
-                pdf_file.seek(0)
-                pdf_doc = fitz_module.open(stream=pdf_file.read(), filetype="pdf")
-            text = "\n".join([page.get_text() for page in pdf_doc])
-            pdf_doc.close()
-        else:
-            return "", ""
+            try:
+                if isinstance(pdf_file, str):
+                    with pdfplumber_module.open(pdf_file) as pdf:
+                        text = "\n".join([page.extract_text() or "" for page in pdf.pages])
+                else:
+                    # File object - need to reset position
+                    pdf_file.seek(0)
+                    with pdfplumber_module.open(pdf_file) as pdf:
+                        text = "\n".join([page.extract_text() or "" for page in pdf.pages])
+                extraction_success = True
+            except Exception as e:
+                # Try fallback method
+                pass
+        
+        if not extraction_success and PDF_LIB == "fitz" and fitz_module:
+            # PyMuPDF (fitz) as fallback
+            try:
+                if isinstance(pdf_file, str):
+                    # File path
+                    pdf_doc = fitz_module.open(pdf_file)
+                else:
+                    # File object
+                    pdf_file.seek(0)
+                    pdf_doc = fitz_module.open(stream=pdf_file.read(), filetype="pdf")
+                text = "\n".join([page.get_text() for page in pdf_doc])
+                pdf_doc.close()
+                extraction_success = True
+            except Exception as e:
+                pass
+        
+        # If still no text extracted, check if it's a scanned PDF
+        if not text or len(text.strip()) < 10:
+            # Might be a scanned PDF (image-based, requires OCR)
+            # Return minimal text to indicate file exists but needs OCR
+            return "", filename
         
         # Clean text
         text = " ".join(text.split())
+        if len(text.strip()) < 10:
+            # Very little text extracted - likely scanned PDF
+            return "", filename
+        
         return text, filename
     except Exception as e:
-        st.error(f"Error extracting PDF: {str(e)}")
-        return "", ""
+        # Return empty text but keep filename for preview purposes
+        return "", filename if isinstance(pdf_file, str) else (getattr(pdf_file, 'name', 'unknown.pdf'))
 
 def chunk_text(text: str, chunk_size: int = 1000) -> List[str]:
     """Split text into chunks for processing"""
@@ -1133,12 +1403,13 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
                             user_email_clean = filter_email.lower().replace('@', '_').replace('.', '_')
                             if user_email_clean not in filename.lower():
                                 # Check database for user association
-                                cursor = db_conn.cursor()
-                                cursor.execute("""
-                                    SELECT uploaded_by FROM pdf_resources 
+                                table_name = get_table_name("pdf_resources")
+                                cursor = execute_query(f"""
+                                    SELECT uploaded_by FROM {table_name} 
                                     WHERE filepath = ? OR filename = ?
                                 """, (filepath, filename))
                                 result = cursor.fetchone()
+                                cursor.close()
                                 if result and result[0] and result[0].lower() != filter_email.lower():
                                     continue  # Skip files not uploaded by this user
                                 elif not result:
@@ -1148,6 +1419,24 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
                         
                         file_size = os.path.getsize(filepath)
                         mtime = os.path.getmtime(filepath)
+                        
+                        # Check database for downloadable status
+                        is_downloadable = True  # Default
+                        if source == "Admin":
+                            columns_check = get_table_columns("pdf_resources")
+                            has_downloadable_col = 'is_downloadable' in columns_check
+                            
+                            if has_downloadable_col:
+                                table_name = get_table_name("pdf_resources")
+                                cursor_check = execute_query(f"""
+                                    SELECT is_downloadable FROM {table_name} 
+                                    WHERE filepath = ? OR filename = ?
+                                """, (filepath, filename))
+                                result_check = cursor_check.fetchone()
+                                cursor_check.close()
+                                if result_check:
+                                    is_downloadable = bool(result_check[0])
+                        
                         dir_docs.append({
                             "filename": filename,
                             "filepath": filepath,
@@ -1155,7 +1444,8 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
                             "date": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d"),
                             "size": file_size,
                             "size_mb": round(file_size / (1024 * 1024), 2),
-                            "type": "PDF" if filename.lower().endswith('.pdf') else "Word"
+                            "type": "PDF" if filename.lower().endswith('.pdf') else "Word",
+                            "is_downloadable": is_downloadable
                         })
                     except (OSError, ValueError):
                         continue  # Skip files that can't be accessed
@@ -1173,12 +1463,13 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
         uploads_dir = "uploads"
         os.makedirs(uploads_dir, exist_ok=True)
         # Get user's documents from database
-        cursor = db_conn.cursor()
-        cursor.execute("""
-            SELECT filepath, filename FROM pdf_resources 
+        table_name = get_table_name("pdf_resources")
+        cursor = execute_query(f"""
+            SELECT filepath, filename FROM {table_name} 
             WHERE uploaded_by = ?
         """, (user_email.lower(),))
         user_docs = cursor.fetchall()
+        cursor.close()
         
         # Add documents from database
         for doc_path, doc_filename in user_docs:
@@ -1500,7 +1791,7 @@ def generate_premium_code(length: int = 12) -> str:
 def create_premium_codes(num_codes: int, length: int, expiry_days: Optional[int], max_uses: int, created_by: str, access_level: str = "Premium") -> List[str]:
     """Create premium codes in database with specified access level"""
     codes = []
-    cursor = db_conn.cursor()
+    table_name = get_table_name("premium_codes")
     
     for _ in range(num_codes):
         code = generate_premium_code(length)
@@ -1509,56 +1800,58 @@ def create_premium_codes(num_codes: int, length: int, expiry_days: Optional[int]
             expiry = (datetime.now() + timedelta(days=expiry_days)).isoformat()
         
         # Check if access_level column exists
-        cursor.execute("PRAGMA table_info(premium_codes)")
-        columns = [col[1] for col in cursor.fetchall()]
+        columns = get_table_columns("premium_codes")
         has_access_level = 'access_level' in columns
         
         if has_access_level:
-            cursor.execute("""
-                INSERT INTO premium_codes (code, status, expiry_date, max_uses, uses_left, created_at, created_by, access_level)
+            cursor = execute_query(f"""
+                INSERT INTO {table_name} (code, status, expiry_date, max_uses, uses_left, created_at, created_by, access_level)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (code, "active", expiry, max_uses, max_uses, datetime.now().isoformat(), created_by, access_level))
         else:
             # Fallback for databases without access_level column
-            cursor.execute("""
-                INSERT INTO premium_codes (code, status, expiry_date, max_uses, uses_left, created_at, created_by)
+            cursor = execute_query(f"""
+                INSERT INTO {table_name} (code, status, expiry_date, max_uses, uses_left, created_at, created_by)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (code, "active", expiry, max_uses, max_uses, datetime.now().isoformat(), created_by))
         
         codes.append(code)
+        cursor.close()
     
-    db_conn.commit()
+    if is_snowflake():
+        db_conn.commit()
     return codes
 
 def validate_premium_code(code: str) -> Tuple[bool, str, Optional[str]]:
     """Validate a premium code and return access level"""
-    cursor = db_conn.cursor()
+    table_name = get_table_name("premium_codes")
     
     # Check if access_level column exists
-    cursor.execute("PRAGMA table_info(premium_codes)")
-    columns = [col[1] for col in cursor.fetchall()]
+    columns = get_table_columns("premium_codes")
     has_access_level = 'access_level' in columns
     
     if has_access_level:
-        cursor.execute("""
+        cursor = execute_query(f"""
             SELECT status, expiry_date, uses_left, max_uses, access_level
-            FROM premium_codes
+            FROM {table_name}
             WHERE code = ?
         """, (code,))
         
         result = cursor.fetchone()
+        cursor.close()
         if not result:
             return False, "Code not found", None
         
         status, expiry_date, uses_left, max_uses, access_level = result
     else:
-        cursor.execute("""
+        cursor = execute_query(f"""
             SELECT status, expiry_date, uses_left, max_uses
-            FROM premium_codes
+            FROM {table_name}
             WHERE code = ?
         """, (code,))
         
         result = cursor.fetchone()
+        cursor.close()
         if not result:
             return False, "Code not found", None
         
@@ -1580,22 +1873,26 @@ def validate_premium_code(code: str) -> Tuple[bool, str, Optional[str]]:
 
 def use_premium_code(code: str, session_id: str):
     """Mark a premium code as used"""
-    cursor = db_conn.cursor()
+    premium_table = get_table_name("premium_codes")
+    usage_table = get_table_name("code_usage")
     
     # Decrement uses_left
-    cursor.execute("""
-        UPDATE premium_codes
+    cursor = execute_query(f"""
+        UPDATE {premium_table}
         SET uses_left = uses_left - 1
         WHERE code = ?
     """, (code,))
+    cursor.close()
     
     # Record usage
-    cursor.execute("""
-        INSERT INTO code_usage (code, used_at, session_id)
+    cursor = execute_query(f"""
+        INSERT INTO {usage_table} (code, used_at, session_id)
         VALUES (?, ?, ?)
     """, (code, datetime.now().isoformat(), session_id))
+    cursor.close()
     
-    db_conn.commit()
+    if is_snowflake():
+        db_conn.commit()
     
     # Note: Cache will expire naturally (10s TTL), or can be manually cleared if needed
     # Streamlit cache_data doesn't support per-parameter clearing, so we rely on short TTL
@@ -1606,26 +1903,30 @@ def use_premium_code(code: str, session_id: str):
 
 def login_user(email: str) -> Tuple[bool, Dict]:
     """Login user by email, create if doesn't exist"""
-    cursor = db_conn.cursor()
+    table_name = get_table_name("users")
     email = email.strip().lower()
     
     # Check if user exists
-    cursor.execute("""
+    cursor = execute_query(f"""
         SELECT email, access_level, questions_answered, premium_code_used, is_admin
-        FROM users
+        FROM {table_name}
         WHERE email = ?
     """, (email,))
     
     result = cursor.fetchone()
+    cursor.close()
     
     if result:
         # User exists, update last login
-        cursor.execute("""
-            UPDATE users
+        cursor = execute_query(f"""
+            UPDATE {table_name}
             SET last_login = ?
             WHERE email = ?
         """, (datetime.now().isoformat(), email))
-        db_conn.commit()
+        cursor.close()
+        
+        if is_snowflake():
+            db_conn.commit()
         
         return True, {
             "email": result[0],
@@ -1636,11 +1937,14 @@ def login_user(email: str) -> Tuple[bool, Dict]:
         }
     else:
         # Create new user with Free access
-        cursor.execute("""
-            INSERT INTO users (email, access_level, questions_answered, created_at, last_login, is_admin)
+        cursor = execute_query(f"""
+            INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (email, "Free", 0, datetime.now().isoformat(), datetime.now().isoformat(), 0))
-        db_conn.commit()
+        cursor.close()
+        
+        if is_snowflake():
+            db_conn.commit()
         
         return True, {
             "email": email,
@@ -1652,43 +1956,54 @@ def login_user(email: str) -> Tuple[bool, Dict]:
 
 def update_user_access_level(email: str, access_level: str):
     """Update user access level (Free or Premium)"""
-    cursor = db_conn.cursor()
-    cursor.execute("""
-        UPDATE users
+    table_name = get_table_name("users")
+    cursor = execute_query(f"""
+        UPDATE {table_name}
         SET access_level = ?
         WHERE email = ?
     """, (access_level, email))
-    db_conn.commit()
+    cursor.close()
+    
+    if is_snowflake():
+        db_conn.commit()
 
 def update_user_questions_answered(email: str, count: int):
     """Update user's questions answered count"""
-    cursor = db_conn.cursor()
-    cursor.execute("""
-        UPDATE users
+    table_name = get_table_name("users")
+    cursor = execute_query(f"""
+        UPDATE {table_name}
         SET questions_answered = questions_answered + ?
         WHERE email = ?
     """, (count, email))
-    db_conn.commit()
+    cursor.close()
+    
+    if is_snowflake():
+        db_conn.commit()
     
     # Also update session state
-    cursor.execute("""
-        SELECT questions_answered FROM users WHERE email = ?
+    cursor = execute_query(f"""
+        SELECT questions_answered FROM {table_name} WHERE email = ?
     """, (email,))
     result = cursor.fetchone()
+    cursor.close()
     if result:
         st.session_state.questions_answered = result[0]
 
 @st.cache_data(ttl=60)  # Cache for 1 minute
 def get_user_info(email: str) -> Optional[Dict]:
     """Get user information (cached)"""
-    cursor = db_conn.cursor()
-    cursor.execute("""
+    table_name = get_table_name("users")
+    cursor = execute_query(f"""
         SELECT email, access_level, questions_answered, premium_code_used, is_admin
-        FROM users
+        FROM {table_name}
         WHERE email = ?
     """, (email,))
-    
+    # execute_query should normally return a valid cursor, but guard against None
+    if cursor is None:
+        return None
+
     result = cursor.fetchone()
+    cursor.close()
     if result:
         return {
             "email": result[0],
@@ -1703,35 +2018,70 @@ def get_user_info(email: str) -> Optional[Dict]:
 # PDF RESOURCE MANAGEMENT
 # ============================================================================
 
-def save_pdf_resource(filename: str, filepath: str, is_premium_only: bool, use_for_ai: bool, uploaded_by: str, description: str = ""):
+def save_pdf_resource(filename: str, filepath: str, is_premium_only: bool, use_for_ai: bool, uploaded_by: str, description: str = "", is_downloadable: bool = True):
     """Save PDF resource to database"""
-    cursor = db_conn.cursor()
-    cursor.execute("""
-        INSERT INTO pdf_resources (filename, filepath, is_premium_only, use_for_ai_generation, uploaded_at, uploaded_by, description)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (filename, filepath, 1 if is_premium_only else 0, 1 if use_for_ai else 0, 
-          datetime.now().isoformat(), uploaded_by, description))
-    db_conn.commit()
+    table_name = get_table_name("pdf_resources")
+    # Check if is_downloadable column exists
+    columns = get_table_columns("pdf_resources")
+    has_downloadable = 'is_downloadable' in columns
+    
+    if has_downloadable:
+        cursor = execute_query(f"""
+            INSERT INTO {table_name} (filename, filepath, is_premium_only, use_for_ai_generation, uploaded_at, uploaded_by, description, is_downloadable)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (filename, filepath, 1 if is_premium_only else 0, 1 if use_for_ai else 0, 
+              datetime.now().isoformat(), uploaded_by, description, 1 if is_downloadable else 0))
+    else:
+        cursor = execute_query(f"""
+            INSERT INTO {table_name} (filename, filepath, is_premium_only, use_for_ai_generation, uploaded_at, uploaded_by, description)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (filename, filepath, 1 if is_premium_only else 0, 1 if use_for_ai else 0, 
+              datetime.now().isoformat(), uploaded_by, description))
+    cursor.close()
+    
+    if is_snowflake():
+        db_conn.commit()
 
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def get_pdf_resources(premium_only: Optional[bool] = None) -> List[Dict]:
     """Get PDF resources, optionally filtered by premium status (cached)"""
-    cursor = db_conn.cursor()
+    table_name = get_table_name("pdf_resources")
+    # Check if is_downloadable column exists
+    columns = get_table_columns("pdf_resources")
+    has_downloadable = 'is_downloadable' in columns
+    
     if premium_only is not None:
-        cursor.execute("""
-            SELECT id, filename, filepath, is_premium_only, use_for_ai_generation, uploaded_at, description
-            FROM pdf_resources
-            WHERE is_premium_only = ?
-            ORDER BY uploaded_at DESC
-        """, (1 if premium_only else 0,))
+        if has_downloadable:
+            cursor = execute_query(f"""
+                SELECT id, filename, filepath, is_premium_only, use_for_ai_generation, uploaded_at, description, is_downloadable
+                FROM {table_name}
+                WHERE is_premium_only = ?
+                ORDER BY uploaded_at DESC
+            """, (1 if premium_only else 0,))
+        else:
+            cursor = execute_query(f"""
+                SELECT id, filename, filepath, is_premium_only, use_for_ai_generation, uploaded_at, description
+                FROM {table_name}
+                WHERE is_premium_only = ?
+                ORDER BY uploaded_at DESC
+            """, (1 if premium_only else 0,))
     else:
-        cursor.execute("""
-            SELECT id, filename, filepath, is_premium_only, use_for_ai_generation, uploaded_at, description
-            FROM pdf_resources
-            ORDER BY uploaded_at DESC
-        """)
+        if has_downloadable:
+            cursor = execute_query(f"""
+                SELECT id, filename, filepath, is_premium_only, use_for_ai_generation, uploaded_at, description, is_downloadable
+                FROM {table_name}
+                ORDER BY uploaded_at DESC
+            """)
+        else:
+            cursor = execute_query(f"""
+                SELECT id, filename, filepath, is_premium_only, use_for_ai_generation, uploaded_at, description
+                FROM {table_name}
+                ORDER BY uploaded_at DESC
+            """)
     
     results = cursor.fetchall()
+    cursor.close()
+    
     return [
         {
             "id": r[0],
@@ -1740,14 +2090,15 @@ def get_pdf_resources(premium_only: Optional[bool] = None) -> List[Dict]:
             "is_premium_only": bool(r[3]),
             "use_for_ai_generation": bool(r[4]),
             "uploaded_at": r[5],
-            "description": r[6]
+            "description": r[6],
+            "is_downloadable": bool(r[7]) if has_downloadable and len(r) > 7 else True  # Default to True if column doesn't exist
         }
         for r in results
     ]
 
 def update_pdf_resource(resource_id: int, is_premium_only: Optional[bool] = None, use_for_ai: Optional[bool] = None):
     """Update PDF resource settings"""
-    cursor = db_conn.cursor()
+    table_name = get_table_name("pdf_resources")
     updates = []
     params = []
     
@@ -1761,18 +2112,24 @@ def update_pdf_resource(resource_id: int, is_premium_only: Optional[bool] = None
     
     if updates:
         params.append(resource_id)
-        cursor.execute(f"""
-            UPDATE pdf_resources
+        cursor = execute_query(f"""
+            UPDATE {table_name}
             SET {', '.join(updates)}
             WHERE id = ?
-        """, params)
-        db_conn.commit()
+        """, tuple(params))
+        cursor.close()
+        
+        if is_snowflake():
+            db_conn.commit()
 
 def delete_pdf_resource(resource_id: int):
     """Delete PDF resource"""
-    cursor = db_conn.cursor()
-    cursor.execute("DELETE FROM pdf_resources WHERE id = ?", (resource_id,))
-    db_conn.commit()
+    table_name = get_table_name("pdf_resources")
+    cursor = execute_query(f"DELETE FROM {table_name} WHERE id = ?", (resource_id,))
+    cursor.close()
+    
+    if is_snowflake():
+        db_conn.commit()
 
 # ============================================================================
 # PAYMENT RECEIPT MANAGEMENT
@@ -1780,12 +2137,15 @@ def delete_pdf_resource(resource_id: int):
 
 def save_payment_receipt(name: str, email: str, reference: str, filename: str):
     """Save payment receipt to database"""
-    cursor = db_conn.cursor()
-    cursor.execute("""
-        INSERT INTO payment_receipts (full_name, email, gcash_reference, receipt_filename, status, submitted_at)
+    table_name = get_table_name("payment_receipts")
+    cursor = execute_query(f"""
+        INSERT INTO {table_name} (full_name, email, gcash_reference, receipt_filename, status, submitted_at)
         VALUES (?, ?, ?, ?, ?, ?)
     """, (name, email, reference, filename, "Pending", datetime.now().isoformat()))
-    db_conn.commit()
+    cursor.close()
+    
+    if is_snowflake():
+        db_conn.commit()
 
 # ============================================================================
 # UI COMPONENTS - PNP THEME
@@ -2157,15 +2517,29 @@ def render_badge(text: str, color: str):
 
 # Helper function for admin panel - get all users (cached)
 @st.cache_data(ttl=120)  # Cache for 2 minutes
+@st.cache_data(ttl=300)
 def get_all_users_cached():
     """Get all users for admin panel (cached)"""
-    cursor = db_conn.cursor()
-    cursor.execute("""
-        SELECT email, access_level, questions_answered, created_at, last_login
-        FROM users
+    table_name = get_table_name("users")
+    cursor = execute_query(f"""
+        SELECT email, access_level, questions_answered, created_at, last_login, premium_code_used, is_admin
+        FROM {table_name}
         ORDER BY created_at DESC
     """)
-    return cursor.fetchall()
+    results = cursor.fetchall()
+    cursor.close()
+    return [
+        {
+            "email": r[0],
+            "access_level": r[1],
+            "questions_answered": r[2],
+            "created_at": r[3],
+            "last_login": r[4],
+            "premium_code_used": r[5] if len(r) > 5 else None,
+            "is_admin": bool(r[6]) if len(r) > 6 else False
+        }
+        for r in results
+    ]
 
 # Inject theme
 inject_pnp_theme_css()
@@ -2404,10 +2778,21 @@ elif page == "📄 Upload Reviewer":
                     with col3:
                         st.markdown(f'<span style="background: {source_color}; color: white; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.8rem;">{doc["source"]}</span>', unsafe_allow_html=True)
                     with col4:
+                        # Show download status and button based on permissions
                         if doc['source'] == "Admin" and doc.get('is_premium_only') and st.session_state.user_access_level != "Premium":
                             st.markdown("🔒 Premium")
+                        elif doc['source'] == "Admin" and not doc.get('is_downloadable', True):
+                            st.markdown("👁️ Preview Only", help="This file is preview-only and cannot be downloaded")
                         else:
-                            if os.path.exists(doc_path):
+                            # Check if user owns the file or if it's downloadable
+                            can_download = True
+                            if doc['source'] == "Admin":
+                                can_download = doc.get('is_downloadable', True)
+                            elif doc['source'] == "Uploaded":
+                                # Users can always download their own files
+                                can_download = True
+                            
+                            if can_download and os.path.exists(doc_path):
                                 with open(doc_path, "rb") as f:
                                     file_data = f.read()
                                     st.download_button(
@@ -2415,8 +2800,11 @@ elif page == "📄 Upload Reviewer":
                                         data=file_data,
                                         file_name=doc['filename'],
                                         mime="application/pdf" if doc['type'] == "PDF" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                        key=f"dl_{doc_path}"
+                                        key=f"dl_{doc_path}",
+                                        help="Download this file"
                                     )
+                            elif doc['source'] == "Admin":
+                                st.markdown("👁️ Preview Only")
             
             st.markdown("---")
             
@@ -2426,14 +2814,21 @@ elif page == "📄 Upload Reviewer":
                     selected_paths = [doc['filepath'] for doc in all_documents if st.session_state.document_selections.get(doc['filepath'], False)]
                     if selected_paths:
                         with st.spinner("Extracting text from selected documents..."):
-                            combined_text = extract_text_from_documents(selected_paths)
-                            if combined_text:
-                                st.session_state.pdf_text = combined_text
-                                st.session_state.pdf_name = f"Combined from {selected_count} document(s)"
-                                st.success(f"✅ Loaded content from {selected_count} document(s)!")
-                                with st.expander("📖 Preview (First 1000 characters)"):
-                                    st.text(combined_text[:1000] + "..." if len(combined_text) > 1000 else combined_text)
-                                st.metric("Total Characters", f"{len(combined_text):,}")
+                            try:
+                                combined_text = extract_text_from_documents(selected_paths)
+                                if combined_text and len(combined_text.strip()) >= 10:
+                                    st.session_state.pdf_text = combined_text
+                                    st.session_state.pdf_name = f"Combined from {selected_count} document(s)"
+                                    st.success(f"✅ Loaded content from {selected_count} document(s)!")
+                                    with st.expander("📖 Preview (First 1000 characters)"):
+                                        st.text(combined_text[:1000] + "..." if len(combined_text) > 1000 else combined_text)
+                                    st.metric("Total Characters", f"{len(combined_text):,}")
+                                else:
+                                    st.warning("⚠️ Preview available, but text extraction was limited. Some documents may be scanned PDFs (image-based) that require OCR for full text extraction.")
+                                    st.info("💡 The documents are available for preview, but AI question generation may be limited. Contact admin if you need OCR-enabled documents.")
+                            except Exception as e:
+                                st.warning(f"⚠️ Preview available, but some documents could not be fully processed: {str(e)}")
+                                st.info("💡 Documents are available for viewing. Some may be scanned PDFs that require OCR.")
     
     st.markdown("---")
     
@@ -2522,7 +2917,14 @@ elif page == "📄 Upload Reviewer":
                     
                     st.rerun()
                 else:
-                    st.error("❌ Could not extract text from the uploaded file. Please ensure the file contains readable text.")
+                    # More graceful error handling
+                    st.warning("⚠️ Text extraction was limited or unsuccessful. This file may be:")
+                    st.markdown("""
+                    - A scanned PDF (image-based) requiring OCR
+                    - A protected/encrypted document
+                    - A file with minimal text content
+                    """)
+                    st.info("💡 The file has been uploaded and is available in your document library. You can still use it for preview, but AI question generation may be limited. Contact admin if you need OCR-enabled processing.")
     
     st.markdown("---")
     
@@ -3315,31 +3717,31 @@ elif page == "🛠️ Admin Panel":
     with tab2:
         st.markdown("### 📋 Code Database")
         
-        cursor = db_conn.cursor()
-        
         # Check if access_level column exists
-        cursor.execute("PRAGMA table_info(premium_codes)")
-        columns = [col[1] for col in cursor.fetchall()]
+        columns = get_table_columns("premium_codes")
         has_access_level = 'access_level' in columns
         
+        table_name = get_table_name("premium_codes")
         if has_access_level:
-            cursor.execute("""
+            cursor = execute_query(f"""
                 SELECT code, status, expiry_date, max_uses, uses_left, created_at, access_level
-                FROM premium_codes
+                FROM {table_name}
                 ORDER BY created_at DESC
             """)
             codes_data = cursor.fetchall()
+            cursor.close()
             if codes_data:
                 df = pd.DataFrame(codes_data, columns=["Code", "Status", "Expiry", "Max Uses", "Uses Left", "Created At", "Access Level"])
             else:
                 df = None
         else:
-            cursor.execute("""
+            cursor = execute_query(f"""
                 SELECT code, status, expiry_date, max_uses, uses_left, created_at
-                FROM premium_codes
+                FROM {table_name}
                 ORDER BY created_at DESC
             """)
             codes_data = cursor.fetchall()
+            cursor.close()
             if codes_data:
                 df = pd.DataFrame(codes_data, columns=["Code", "Status", "Expiry", "Max Uses", "Uses Left", "Created At"])
                 df["Access Level"] = "Premium"  # Default for old codes
@@ -3360,14 +3762,15 @@ elif page == "🛠️ Admin Panel":
     with tab3:
         st.markdown("### 💳 Receipt Validation")
         
-        cursor = db_conn.cursor()
-        cursor.execute("""
+        table_name = get_table_name("payment_receipts")
+        cursor = execute_query(f"""
             SELECT id, full_name, email, gcash_reference, receipt_filename, status, submitted_at
-            FROM payment_receipts
+            FROM {table_name}
             ORDER BY submitted_at DESC
         """)
         
         receipts_data = cursor.fetchall()
+        cursor.close()
         
         if receipts_data:
             df = pd.DataFrame(receipts_data, columns=["ID", "Name", "Email", "GCash Ref", "Receipt", "Status", "Submitted"])
@@ -3384,12 +3787,14 @@ elif page == "🛠️ Admin Panel":
             receipt_id_view = st.number_input("Receipt ID to View", min_value=1, key="receipt_view_id")
             
             if receipt_id_view:
-                cursor.execute("""
+                table_name = get_table_name("payment_receipts")
+                cursor = execute_query(f"""
                     SELECT receipt_filename, full_name, email, status
-                    FROM payment_receipts
+                    FROM {table_name}
                     WHERE id = ?
                 """, (receipt_id_view,))
                 receipt_info = cursor.fetchone()
+                cursor.close()
                 
                 if receipt_info:
                     receipt_filename, full_name, email, status = receipt_info
@@ -3427,20 +3832,25 @@ elif page == "🛠️ Admin Panel":
             
             if st.button("💾 Update Status", type="primary"):
                 # Get receipt info before updating
-                cursor.execute("""
+                table_name = get_table_name("payment_receipts")
+                cursor = execute_query(f"""
                     SELECT email, full_name
-                    FROM payment_receipts
+                    FROM {table_name}
                     WHERE id = ?
                 """, (receipt_id,))
                 receipt_info = cursor.fetchone()
+                cursor.close()
                 
                 # Update receipt status
-                cursor.execute("""
-                    UPDATE payment_receipts
+                cursor = execute_query(f"""
+                    UPDATE {table_name}
                     SET status = ?, reviewed_at = ?, reviewed_by = ?, notes = ?
                     WHERE id = ?
                 """, (new_status, datetime.now().isoformat(), "admin", admin_notes, receipt_id))
-                db_conn.commit()
+                cursor.close()
+                
+                if is_snowflake():
+                    db_conn.commit()
                 
                 # If approved, update user access level
                 if new_status == "Approved" and receipt_info:
@@ -3449,15 +3859,21 @@ elif page == "🛠️ Admin Panel":
                     
                     # Determine access level based on payment amount or notes
                     # Check if user exists, create if not
-                    cursor.execute("SELECT email FROM users WHERE email = ?", (receipt_email.lower(),))
+                    table_name = get_table_name("users")
+                    cursor = execute_query(f"SELECT email FROM {table_name} WHERE email = ?", (receipt_email.lower(),))
                     user_exists = cursor.fetchone()
                     
+                    cursor.close()
                     if not user_exists:
                         # Create user account
-                        cursor.execute("""
-                            INSERT INTO users (email, access_level, questions_answered, created_at, last_login, is_admin)
+                        table_name = get_table_name("users")
+                        cursor = execute_query(f"""
+                            INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin)
                             VALUES (?, ?, ?, ?, ?, ?)
                         """, (receipt_email.lower(), "Free", 0, datetime.now().isoformat(), datetime.now().isoformat(), 0))
+                        cursor.close()
+                        if is_snowflake():
+                            db_conn.commit()
                     
                     # Determine access level - check notes for "Advance" or "Premium", default to Premium
                     access_level = "Premium"  # Default for approved receipts
@@ -3493,12 +3909,13 @@ elif page == "🛠️ Admin Panel":
             uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf", "docx", "doc"], key="admin_pdf_upload_tab4")
             is_premium_only = st.checkbox("Premium Only", value=False, help="Only Premium users can download this PDF")
             use_for_ai = st.checkbox("Use for AI Question Generation", value=True, help="Include this PDF in AI question generation")
+            is_downloadable = st.checkbox("Allow Download", value=True, help="✅ Downloadable: Users can download this file | ❌ Preview-only: Users can only preview, not download")
             description = st.text_area("Description (optional)", placeholder="Brief description of this PDF")
             
             if st.form_submit_button("📤 Upload PDF", type="primary", use_container_width=True):
                 if uploaded_pdf:
-                    # Save file
-                    pdf_dir = "data/admin_pdfs"
+                    # Save file to admin_docs directory
+                    pdf_dir = "admin_docs"
                     os.makedirs(pdf_dir, exist_ok=True)
                     filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uploaded_pdf.name}"
                     filepath = os.path.join(pdf_dir, filename)
@@ -3506,8 +3923,9 @@ elif page == "🛠️ Admin Panel":
                     with open(filepath, "wb") as f:
                         f.write(uploaded_pdf.getbuffer())
                     
-                    save_pdf_resource(filename, filepath, is_premium_only, use_for_ai, st.session_state.user_email or "admin", description)
+                    save_pdf_resource(filename, filepath, is_premium_only, use_for_ai, st.session_state.user_email or "admin", description, is_downloadable)
                     st.success(f"✅ PDF uploaded successfully: {filename}")
+                    get_document_library.clear()  # Clear cache
                     st.rerun()
                 else:
                     st.error("Please select a PDF file to upload.")
@@ -3520,18 +3938,75 @@ elif page == "🛠️ Admin Panel":
         
         if pdf_resources:
             for pdf in pdf_resources:
-                with st.expander(f"📄 {pdf['filename']} - {'🔒 Premium' if pdf['is_premium_only'] else '🆓 Free'} - {'🤖 AI Enabled' if pdf['use_for_ai_generation'] else '❌ AI Disabled'}"):
+                download_status = "📥 Downloadable" if pdf.get('is_downloadable', True) else "👁️ Preview Only"
+                with st.expander(f"📄 {pdf['filename']} - {'🔒 Premium' if pdf['is_premium_only'] else '🆓 Free'} - {'🤖 AI Enabled' if pdf['use_for_ai_generation'] else '❌ AI Disabled'} - {download_status}"):
                     col1, col2 = st.columns([2, 1])
                     with col1:
                         st.write(f"**Description:** {pdf.get('description', 'No description')}")
                         st.write(f"**Uploaded:** {pdf['uploaded_at']}")
                         st.write(f"**Uploaded by:** {pdf.get('uploaded_by', 'Unknown')}")
+                        st.write(f"**Download Status:** {'✅ Downloadable' if pdf.get('is_downloadable', True) else '👁️ Preview Only'}")
                     with col2:
                         premium_toggle = st.checkbox("Premium Only", value=pdf['is_premium_only'], key=f"premium_{pdf['id']}")
                         ai_toggle = st.checkbox("Use for AI", value=pdf['use_for_ai_generation'], key=f"ai_{pdf['id']}")
+                        downloadable_toggle = st.checkbox("Allow Download", value=pdf.get('is_downloadable', True), key=f"download_{pdf['id']}", help="✅ Downloadable: Users can download | ❌ Preview-only: Users can only preview")
                         
-                        if st.button("💾 Update", key=f"update_{pdf['id']}"):
-                            update_pdf_resource(pdf['id'], premium_toggle, ai_toggle)
+                        if st.button("💾 Update Settings", key=f"update_{pdf['id']}", use_container_width=True):
+                            table_name = get_table_name("pdf_resources")
+                            # Check if is_downloadable column exists
+                            columns = get_table_columns("pdf_resources")
+                            has_downloadable = 'is_downloadable' in columns
+                            
+                            if has_downloadable:
+                                cursor = execute_query(f"""
+                                    UPDATE {table_name}
+                                    SET is_premium_only = ?, use_for_ai_generation = ?, is_downloadable = ?
+                                    WHERE id = ?
+                                """, (1 if premium_toggle else 0, 1 if ai_toggle else 0, 1 if downloadable_toggle else 0, pdf['id']))
+                            else:
+                                cursor = execute_query(f"""
+                                    UPDATE {table_name}
+                                    SET is_premium_only = ?, use_for_ai_generation = ?
+                                    WHERE id = ?
+                                """, (1 if premium_toggle else 0, 1 if ai_toggle else 0, pdf['id']))
+                            cursor.close()
+                            
+                            if is_snowflake():
+                                db_conn.commit()
+                            get_pdf_resources.clear()  # Clear cache
+                            get_document_library.clear()  # Clear cache
+                            st.success(f"✅ Settings updated for {pdf['filename']}")
+                            st.rerun()
+                        ai_toggle = st.checkbox("Use for AI", value=pdf['use_for_ai_generation'], key=f"ai_{pdf['id']}")
+                        
+                        downloadable_toggle = st.checkbox("Allow Download", value=pdf.get('is_downloadable', True), key=f"download_{pdf['id']}", help="✅ Downloadable: Users can download | ❌ Preview-only: Users can only preview")
+                        
+                        if st.button("💾 Update Settings", key=f"update_{pdf['id']}", use_container_width=True):
+                            table_name = get_table_name("pdf_resources")
+                            # Check if is_downloadable column exists
+                            columns = get_table_columns("pdf_resources")
+                            has_downloadable = 'is_downloadable' in columns
+                            
+                            if has_downloadable:
+                                cursor = execute_query(f"""
+                                    UPDATE {table_name}
+                                    SET is_premium_only = ?, use_for_ai_generation = ?, is_downloadable = ?
+                                    WHERE id = ?
+                                """, (1 if premium_toggle else 0, 1 if ai_toggle else 0, 1 if downloadable_toggle else 0, pdf['id']))
+                            else:
+                                cursor = execute_query(f"""
+                                    UPDATE {table_name}
+                                    SET is_premium_only = ?, use_for_ai_generation = ?
+                                    WHERE id = ?
+                                """, (1 if premium_toggle else 0, 1 if ai_toggle else 0, pdf['id']))
+                            cursor.close()
+                            
+                            if is_snowflake():
+                                db_conn.commit()
+                            get_pdf_resources.clear()  # Clear cache
+                            get_document_library.clear()  # Clear cache
+                            st.success(f"✅ Settings updated for {pdf['filename']}")
+                            st.rerun()
                             st.success("✅ Updated!")
                             st.rerun()
                         
@@ -3550,14 +4025,15 @@ elif page == "🛠️ Admin Panel":
         users_data = get_all_users_cached()
         
         # Get approved receipts
-        cursor = db_conn.cursor()
-        cursor.execute("""
+        table_name = get_table_name("payment_receipts")
+        cursor = execute_query(f"""
             SELECT email, full_name, status, reviewed_at, notes
-            FROM payment_receipts
+            FROM {table_name}
             WHERE status = 'Approved'
             ORDER BY reviewed_at DESC
         """)
         approved_receipts = cursor.fetchall()
+        cursor.close()
         
         # Add new user section
         st.markdown("#### ➕ Add New User")
@@ -3571,7 +4047,8 @@ elif page == "🛠️ Admin Panel":
                 if st.form_submit_button("➕ Add User", type="primary", use_container_width=True):
                     if new_user_email and "@" in new_user_email and "." in new_user_email.split("@")[1]:
                         # Check if user already exists
-                        cursor.execute("SELECT email FROM users WHERE email = ?", (new_user_email.lower(),))
+                        table_name = get_table_name("users")
+                        cursor = execute_query(f"SELECT email FROM {table_name} WHERE email = ?", (new_user_email.lower(),))
                         if cursor.fetchone():
                             st.error(f"❌ User with email {new_user_email} already exists.")
                         else:
