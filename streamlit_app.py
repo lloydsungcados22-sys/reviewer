@@ -1403,8 +1403,8 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
                             user_email_clean = filter_email.lower().replace('@', '_').replace('.', '_')
                             if user_email_clean not in filename.lower():
                                 # Check database for user association
-                            table_name = get_table_name("pdf_resources")
-                            cursor = execute_query(f"""
+                                table_name = get_table_name("pdf_resources")
+                                cursor = execute_query(f"""
                                     SELECT uploaded_by FROM {table_name} 
                                     WHERE filepath = %s OR filename = %s
                                 """, (filepath, filename))
