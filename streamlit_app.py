@@ -94,7 +94,7 @@ except Exception:
 
 def get_easyocr_reader(progress_callback=None, timeout=300):
     """Get or initialize EasyOCR reader (lazy initialization with timeout for cloud)"""
-    global easyocr_reader
+    global easyocr_reader, EASYOCR_AVAILABLE
     if not EASYOCR_AVAILABLE:
         if progress_callback:
             progress_callback("⚠ EasyOCR library not available")
@@ -165,7 +165,6 @@ def get_easyocr_reader(progress_callback=None, timeout=300):
             get_easyocr_reader.retry_count += 1
             if get_easyocr_reader.retry_count > 3:
                 print("❌ EasyOCR initialization failed after 3 attempts, disabling OCR")
-                global EASYOCR_AVAILABLE
                 EASYOCR_AVAILABLE = False
             return None
     return easyocr_reader
