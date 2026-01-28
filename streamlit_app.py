@@ -51,13 +51,43 @@ except ImportError:
         PDF_LIB = None
         pdfplumber_module = None
 
-# Optional OCR support for scanned/image-based PDFs
+# Optional OCR support for scanned/image-based PDFs and documents
+EASYOCR_AVAILABLE = False
+TESSERACT_AVAILABLE = False
+easyocr_reader = None
+
+try:
+    import easyocr
+    EASYOCR_AVAILABLE = True
+    # Initialize EasyOCR reader lazily (on first use to avoid slow startup)
+    # We'll initialize it when needed in the extraction function
+except Exception:
+    EASYOCR_AVAILABLE = False
+
+def get_easyocr_reader():
+    """Get or initialize EasyOCR reader (lazy initialization)"""
+    global easyocr_reader
+    if not EASYOCR_AVAILABLE:
+        return None
+    if easyocr_reader is None:
+        try:
+            import easyocr
+            # Initialize EasyOCR reader (English only for now, can add more languages)
+            # gpu=False for CPU, set gpu=True if CUDA is available
+            easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+        except Exception as e:
+            print(f"EasyOCR initialization error: {e}")
+            return None
+    return easyocr_reader
+
 try:
     from PIL import Image
     import pytesseract
-    OCR_AVAILABLE = True
+    TESSERACT_AVAILABLE = True
 except Exception:
-    OCR_AVAILABLE = False
+    TESSERACT_AVAILABLE = False
+
+OCR_AVAILABLE = EASYOCR_AVAILABLE or TESSERACT_AVAILABLE
 
 # Word document processing
 Document_class = None
@@ -652,7 +682,7 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
             except Exception as e:
                 pass
 
-        # 2) If still no text and OCR is available, try OCR on rendered pages
+        # 2) If still no text and OCR is available, try EasyOCR first, then Tesseract
         if (not extraction_success or not text.strip()) and OCR_AVAILABLE and fitz_module:
             try:
                 if isinstance(pdf_file, str):
@@ -662,27 +692,77 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
                     doc = fitz_module.open(stream=pdf_file.read(), filetype="pdf")
 
                 ocr_chunks = []
-                # Process more pages for OCR (up to 20 pages for better coverage)
-                max_ocr_pages = min(20, len(doc))
-                for page_index in range(max_ocr_pages):
+                # Process more pages for OCR (up to 30 pages for better coverage)
+                max_ocr_pages = min(30, len(doc))
+                
+                # Try EasyOCR first (better for scanned documents)
+                if EASYOCR_AVAILABLE:
+                    reader = get_easyocr_reader()
+                    if reader:
+                        try:
+                            for page_index in range(max_ocr_pages):
+                                try:
+                                    page = doc[page_index]
+                                    # Get higher resolution for better OCR
+                                    zoom = 2.0  # 2x zoom for better OCR accuracy
+                                    mat = fitz_module.Matrix(zoom, zoom)
+                                    pix = page.get_pixmap(matrix=mat)
+                                    mode = "RGB" if pix.alpha == 0 else "RGBA"
+                                    img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+                                    
+                                    # Convert to numpy array for EasyOCR
+                                    import numpy as np
+                                    img_array = np.array(img)
+                                    
+                                    # Use EasyOCR to read text with paragraph grouping
+                                    results = reader.readtext(img_array, paragraph=True, detail=0)
+                                    # results is a list of strings when detail=0
+                                    page_text = "\n".join(results) if results else ""
+                                    
+                                    # Alternative: if detail=0 doesn't work, use detail=1 and extract text
+                                    if not page_text:
+                                        results_detailed = reader.readtext(img_array, paragraph=True)
+                                        page_text = "\n".join([result[1] for result in results_detailed if len(result) > 1 and result[2] > 0.3])
+                                    
+                                    if page_text and page_text.strip():
+                                        ocr_chunks.append(page_text)
+                                except Exception as e:
+                                    continue
+                            
+                            if ocr_chunks:
+                                text = "\n".join(ocr_chunks)
+                                extraction_success = bool(text.strip())
+                        except Exception as e:
+                            import traceback
+                            print(f"EasyOCR error: {str(e)}")
+                            print(traceback.format_exc())
+                
+                # Fallback to Tesseract if EasyOCR didn't work or isn't available
+                if not extraction_success and TESSERACT_AVAILABLE:
                     try:
-                        page = doc[page_index]
-                        # Get higher resolution for better OCR
-                        zoom = 2.0  # 2x zoom for better OCR accuracy
-                        mat = fitz_module.Matrix(zoom, zoom)
-                        pix = page.get_pixmap(matrix=mat)
-                        mode = "RGB" if pix.alpha == 0 else "RGBA"
-                        img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
-                        # Use better OCR config
-                        ocr_text = pytesseract.image_to_string(img, config='--psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.,;:!?()[]{}\'"- ')
-                        if ocr_text and ocr_text.strip():
-                            ocr_chunks.append(ocr_text)
-                    except Exception:
-                        continue
+                        ocr_chunks = []
+                        for page_index in range(max_ocr_pages):
+                            try:
+                                page = doc[page_index]
+                                zoom = 2.0
+                                mat = fitz_module.Matrix(zoom, zoom)
+                                pix = page.get_pixmap(matrix=mat)
+                                mode = "RGB" if pix.alpha == 0 else "RGBA"
+                                img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+                                ocr_text = pytesseract.image_to_string(img, config='--psm 6')
+                                if ocr_text and ocr_text.strip():
+                                    ocr_chunks.append(ocr_text)
+                            except Exception:
+                                continue
+                        if ocr_chunks:
+                            text = "\n".join(ocr_chunks)
+                            extraction_success = bool(text.strip())
+                    except Exception as e:
+                        import traceback
+                        print(f"Tesseract OCR error: {str(e)}")
+                        print(traceback.format_exc())
+                
                 doc.close()
-                if ocr_chunks:
-                    text = "\n".join(ocr_chunks)
-                    extraction_success = bool(text.strip())
             except Exception as e:
                 import traceback
                 print(f"OCR error: {str(e)}")
