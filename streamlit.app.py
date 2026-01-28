@@ -20,11 +20,6 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 import json
 import io
-import fitz
-import pdfplumber
-import docx
-import easyocr
-import pytesseract
 
 import streamlit as st
 
@@ -5072,4 +5067,3 @@ st.markdown("""
     <p>© 2024 PH Criminology Exam Reviewer</p>
 </div>
 """, unsafe_allow_html=True)
-
