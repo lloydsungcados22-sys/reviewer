@@ -109,22 +109,22 @@ RECEIPT_EMAIL = "criminologysupp@gmail.com"
 # ============================================================================
 
 def get_snowflake_config():
-    """Get Snowflake configuration from secrets.toml"""
+    """Get Snowflake configuration from secrets.toml - password authentication only"""
     try:
         snowflake_config = st.secrets["SNOWFLAKE"]
-        # Get password and authenticator
+        # Get password - required for password authentication
         password = snowflake_config.get("password", "")
-        authenticator = snowflake_config.get("authenticator", "")
-        # If password is provided but no authenticator specified, omit authenticator (defaults to password auth)
-        # If no password and no authenticator, default to externalbrowser
-        if not password and not authenticator:
-            authenticator = "externalbrowser"
+        
+        # Only use authenticator if explicitly set (but prefer password auth)
+        authenticator = snowflake_config.get("authenticator", "").strip()
+        # If authenticator is explicitly set to something other than password, use it
+        # Otherwise, use password authentication (don't set authenticator parameter)
         
         return {
             "account": snowflake_config.get("account", ""),
             "user": snowflake_config.get("user", ""),
             "password": password,
-            "authenticator": authenticator,  # Will be empty string if password auth (omit from conn_params)
+            "authenticator": authenticator if authenticator and authenticator.lower() != "password" else "",  # Empty means password auth
             "role": snowflake_config.get("role", ""),
             "warehouse": snowflake_config.get("warehouse", ""),
             "database": snowflake_config.get("database", ""),
@@ -165,17 +165,21 @@ def get_snowflake_connection():
             "user": config["user"].strip(),
         }
         
-        # Add password if provided (for password authentication)
-        if config.get("password") and config["password"].strip():
-            conn_params["password"] = config["password"].strip()
-            # When password is provided, don't include authenticator (defaults to password auth)
-        else:
-            # Only include authenticator if explicitly set, otherwise default to externalbrowser
-            authenticator = config.get("authenticator", "").strip()
-            if authenticator:
-                conn_params["authenticator"] = authenticator
-            else:
-                conn_params["authenticator"] = "externalbrowser"
+        # Require password for authentication (password-only, no external browser)
+        password = config.get("password", "").strip()
+        if not password:
+            st.error("❌ **Password is required** for Snowflake connection. Please set 'password' in secrets.toml [SNOWFLAKE] section.")
+            st.error("⚠️ External browser authentication is not supported. Password authentication is required.")
+            st.stop()
+            return None
+        
+        conn_params["password"] = password
+        # Only include authenticator if explicitly set to something other than password
+        # If authenticator is empty or "password", omit it (defaults to password auth)
+        authenticator = config.get("authenticator", "").strip()
+        if authenticator and authenticator.lower() not in ["", "password"]:
+            conn_params["authenticator"] = authenticator
+        # Otherwise, don't set authenticator - Snowflake will use password authentication by default
         
         # Add optional parameters only if they are provided and not empty
         if config.get("role") and config["role"].strip() and config["role"] != "<none selected>":
@@ -215,19 +219,19 @@ def get_snowflake_connection():
             1. **Verify Account Format**: The account in secrets.toml should be in format `orgname-accountname` (dash-separated).
                Current value: `{account}`
             
-            2. **For externalbrowser authenticator**:
-               - Ensure you have browser access and can authenticate via browser
-               - The first connection may require manual browser authentication
-               - Check if your organization requires SSO/SAML login
+            2. **Password Authentication Required**:
+               - This application requires password authentication (external browser is not supported)
+               - Ensure `password = "your_password"` is set in secrets.toml [SNOWFLAKE] section
+               - Verify your password is correct and has not expired
             
-            3. **Alternative Authentication Methods**:
-               - If you have a password, try changing `authenticator = "password"` in secrets.toml and add `password = "your_password"`
-               - Contact your Snowflake administrator to verify SSO/SAML configuration
-               - Ask your admin if the account requires a different authentication method
+            3. **If Your Account Uses SSO/SAML**:
+               - Contact your Snowflake administrator to set up password authentication
+               - Ask your admin to enable password-based login for your account
+               - Some accounts may require a service account with password authentication
             
             4. **Account Identifier Format**:
-               - For SSO accounts, sometimes the account needs to be in a specific format
                - Verify with your Snowflake admin the correct account identifier for programmatic access
+               - Ensure the account format matches your organization's requirements
             """.format(account=config.get("account", "N/A")))
         elif "Failed to connect" in error_msg:
             st.error("""
@@ -492,7 +496,7 @@ init_session_state()
 # ============================================================================
 
 def extract_text_from_docx(docx_file) -> Tuple[str, str]:
-    """Extract text from Word document"""
+    """Extract text from Word document - comprehensive extraction including tables, headers, footers"""
     try:
         if not DOCX_AVAILABLE or Document_class is None:
             return "", ""
@@ -505,6 +509,7 @@ def extract_text_from_docx(docx_file) -> Tuple[str, str]:
         else:
             filename = "unknown.docx"
         
+        # Open document
         if isinstance(docx_file, str):
             # File path
             doc = Document_class(docx_file)
@@ -513,17 +518,53 @@ def extract_text_from_docx(docx_file) -> Tuple[str, str]:
             docx_file.seek(0)
             doc = Document_class(io.BytesIO(docx_file.read()))
         
-        # Extract text from all paragraphs
-        text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+        text_parts = []
         
-        # Clean text
-        text = " ".join(text.split())
+        # 1. Extract text from all paragraphs
+        for paragraph in doc.paragraphs:
+            if paragraph.text.strip():
+                text_parts.append(paragraph.text.strip())
+        
+        # 2. Extract text from tables
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = []
+                for cell in row.cells:
+                    if cell.text.strip():
+                        row_text.append(cell.text.strip())
+                if row_text:
+                    text_parts.append(" | ".join(row_text))
+        
+        # 3. Extract text from headers
+        for section in doc.sections:
+            if section.header:
+                for paragraph in section.header.paragraphs:
+                    if paragraph.text.strip():
+                        text_parts.append(paragraph.text.strip())
+        
+        # 4. Extract text from footers
+        for section in doc.sections:
+            if section.footer:
+                for paragraph in section.footer.paragraphs:
+                    if paragraph.text.strip():
+                        text_parts.append(paragraph.text.strip())
+        
+        # Combine all text
+        text = "\n".join(text_parts)
+        
+        # Clean text - preserve line breaks for better structure
+        if not text.strip():
+            return "", filename
+        
         return text, filename
     except ImportError:
         return "", ""
     except Exception as e:
-        st.error(f"Error extracting Word document: {str(e)}")
-        return "", ""
+        # Log error but don't show to user immediately - let it be handled by caller
+        import traceback
+        print(f"Error extracting Word document: {str(e)}")
+        print(traceback.format_exc())
+        return "", filename if hasattr(docx_file, 'name') or isinstance(docx_file, str) else "unknown.docx"
 
 def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
     """Extract text from PDF file with improved error handling"""
@@ -548,19 +589,37 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
             try:
                 if isinstance(pdf_file, str):
                     with pdfplumber_module.open(pdf_file) as pdf:
-                        text = "\n".join([page.extract_text() or "" for page in pdf.pages])
+                        # Try multiple extraction methods
+                        page_texts = []
+                        for page in pdf.pages:
+                            # Try extract_text first
+                            page_text = page.extract_text()
+                            if not page_text or len(page_text.strip()) < 10:
+                                # Try extracting tables and text separately
+                                page_text = page.extract_text(layout=True) or page.extract_text() or ""
+                            if page_text:
+                                page_texts.append(page_text)
+                        text = "\n".join(page_texts)
                 else:
                     # File object - need to reset position
                     pdf_file.seek(0)
                     with pdfplumber_module.open(pdf_file) as pdf:
-                        text = "\n".join([page.extract_text() or "" for page in pdf.pages])
-                extraction_success = True
+                        page_texts = []
+                        for page in pdf.pages:
+                            page_text = page.extract_text()
+                            if not page_text or len(page_text.strip()) < 10:
+                                page_text = page.extract_text(layout=True) or page.extract_text() or ""
+                            if page_text:
+                                page_texts.append(page_text)
+                        text = "\n".join(page_texts)
+                if text and text.strip():
+                    extraction_success = True
             except Exception as e:
                 # Try fallback method
                 pass
         
         if not extraction_success and PDF_LIB == "fitz" and fitz_module:
-            # PyMuPDF (fitz) as fallback text extractor
+            # PyMuPDF (fitz) as fallback text extractor - try multiple methods
             try:
                 if isinstance(pdf_file, str):
                     # File path
@@ -569,9 +628,27 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
                     # File object
                     pdf_file.seek(0)
                     pdf_doc = fitz_module.open(stream=pdf_file.read(), filetype="pdf")
-                text = "\n".join([page.get_text() for page in pdf_doc])
+                
+                # Try different text extraction methods
+                page_texts = []
+                for page_num in range(len(pdf_doc)):
+                    page = pdf_doc[page_num]
+                    # Try standard text extraction
+                    page_text = page.get_text()
+                    if not page_text or len(page_text.strip()) < 10:
+                        # Try with different options
+                        page_text = page.get_text("text") or page.get_text("dict") or ""
+                        if isinstance(page_text, dict):
+                            # Extract text from dict format
+                            page_text = " ".join([block.get("text", "") for block in page_text.get("blocks", [])])
+                    
+                    if page_text and page_text.strip():
+                        page_texts.append(page_text)
+                
+                text = "\n".join(page_texts)
                 pdf_doc.close()
-                extraction_success = True
+                if text and text.strip():
+                    extraction_success = True
             except Exception as e:
                 pass
 
@@ -585,20 +662,31 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
                     doc = fitz_module.open(stream=pdf_file.read(), filetype="pdf")
 
                 ocr_chunks = []
-                # Limit OCR to first few pages for performance
-                max_ocr_pages = min(5, len(doc))
+                # Process more pages for OCR (up to 20 pages for better coverage)
+                max_ocr_pages = min(20, len(doc))
                 for page_index in range(max_ocr_pages):
-                    page = doc[page_index]
-                    pix = page.get_pixmap()
-                    mode = "RGB" if pix.alpha == 0 else "RGBA"
-                    img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
-                    ocr_text = pytesseract.image_to_string(img)
-                    if ocr_text:
-                        ocr_chunks.append(ocr_text)
+                    try:
+                        page = doc[page_index]
+                        # Get higher resolution for better OCR
+                        zoom = 2.0  # 2x zoom for better OCR accuracy
+                        mat = fitz_module.Matrix(zoom, zoom)
+                        pix = page.get_pixmap(matrix=mat)
+                        mode = "RGB" if pix.alpha == 0 else "RGBA"
+                        img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+                        # Use better OCR config
+                        ocr_text = pytesseract.image_to_string(img, config='--psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.,;:!?()[]{}\'"- ')
+                        if ocr_text and ocr_text.strip():
+                            ocr_chunks.append(ocr_text)
+                    except Exception:
+                        continue
                 doc.close()
-                text = "\n".join(ocr_chunks)
-                extraction_success = bool(text.strip())
-            except Exception:
+                if ocr_chunks:
+                    text = "\n".join(ocr_chunks)
+                    extraction_success = bool(text.strip())
+            except Exception as e:
+                import traceback
+                print(f"OCR error: {str(e)}")
+                print(traceback.format_exc())
                 pass
         
         # If still no text extracted, return empty string but keep filename
@@ -2996,17 +3084,45 @@ elif page == "📄 Upload Reviewer":
                             except Exception:
                                 pass  # Continue even if database save fails
 
-                        # Extract text
+                        # Extract text - try multiple methods for better success rate
                         file_ext = uploaded_file.name.lower().split(".")[-1] if uploaded_file.name else ""
-                        if file_ext == "pdf":
-                            text, name = extract_text_from_pdf(uploaded_file)
-                        elif file_ext in ["docx", "doc"]:
-                            uploaded_file.seek(0)  # Reset file pointer
-                            text, name = extract_text_from_docx(uploaded_file)
-                        else:
-                            text, name = "", ""
+                        text = ""
+                        name = uploaded_file.name or "Uploaded Document"
+                        
+                        with st.spinner("📄 Extracting text from document... This may take a moment."):
+                            if file_ext == "pdf":
+                                # Try extracting from file object first
+                                uploaded_file.seek(0)
+                                text, name = extract_text_from_pdf(uploaded_file)
+                                
+                                # If that fails, try extracting from saved file path
+                                if not text or not text.strip():
+                                    try:
+                                        text, name = extract_text_from_pdf(file_path)
+                                    except Exception:
+                                        pass
+                                
+                            elif file_ext in ["docx", "doc"]:
+                                # Try extracting from file object first
+                                uploaded_file.seek(0)
+                                text, name = extract_text_from_docx(uploaded_file)
+                                
+                                # If that fails, try extracting from saved file path
+                                if not text or not text.strip():
+                                    try:
+                                        text, name = extract_text_from_docx(file_path)
+                                    except Exception:
+                                        pass
+                            
+                            # If still no text, try OCR for PDFs
+                            if (not text or not text.strip()) and file_ext == "pdf" and OCR_AVAILABLE:
+                                try:
+                                    with st.spinner("🔍 Attempting OCR extraction (this may take longer)..."):
+                                        text, name = extract_text_from_pdf(file_path)
+                                except Exception:
+                                    pass
 
-                        if text:
+                        if text and text.strip():
                             st.session_state.pdf_text = text
                             st.session_state.pdf_name = name
                         else:
