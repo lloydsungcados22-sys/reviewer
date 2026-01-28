@@ -41,6 +41,12 @@ easyocr>=1.7.0
 #    - Use requirements-no-ocr.txt instead (OCR will be disabled but app will work)
 # 5. First deployment may take 10-15 minutes due to large package downloads
 
+streamlit
+python-docx
+pypdf
+pymupdf
+pillow
+
 
 
 
