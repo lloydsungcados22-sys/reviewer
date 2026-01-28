@@ -23,6 +23,34 @@ import io
 
 import streamlit as st
 
+# Detect if running on Streamlit Cloud
+IS_STREAMLIT_CLOUD = os.environ.get("STREAMLIT_SHARING", "").lower() == "true" or \
+                     os.environ.get("STREAMLIT_SERVER_ENVIRONMENT", "").lower() == "cloud" or \
+                     "streamlit.app" in os.environ.get("_", "")
+
+# Base directory for file storage (works on both local and cloud)
+# On Streamlit Cloud, files are stored in the app's working directory
+# Note: Files uploaded to Streamlit Cloud are ephemeral and may be lost on redeploy
+# For persistent storage, consider using cloud storage (S3, GCS) or database
+BASE_DIR = os.getcwd()
+UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
+ADMIN_DOCS_DIR = os.path.join(BASE_DIR, "admin_docs")
+RECEIPTS_DIR = os.path.join(BASE_DIR, "data", "receipts")
+
+# Ensure directories exist
+for directory in [UPLOADS_DIR, ADMIN_DOCS_DIR, RECEIPTS_DIR]:
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except Exception as e:
+        print(f"⚠ Warning: Could not create directory {directory}: {e}")
+
+# Log cloud environment info for debugging (only in development)
+if IS_STREAMLIT_CLOUD:
+    print(f"🌐 Running on Streamlit Cloud")
+    print(f"📁 Working directory: {BASE_DIR}")
+    print(f"📁 Uploads: {UPLOADS_DIR} (exists: {os.path.exists(UPLOADS_DIR)})")
+    print(f"📁 Admin docs: {ADMIN_DOCS_DIR} (exists: {os.path.exists(ADMIN_DOCS_DIR)})")
+
 # Snowflake connector
 try:
     import snowflake.connector
@@ -64,8 +92,8 @@ try:
 except Exception:
     EASYOCR_AVAILABLE = False
 
-def get_easyocr_reader(progress_callback=None):
-    """Get or initialize EasyOCR reader (lazy initialization)"""
+def get_easyocr_reader(progress_callback=None, timeout=300):
+    """Get or initialize EasyOCR reader (lazy initialization with timeout for cloud)"""
     global easyocr_reader
     if not EASYOCR_AVAILABLE:
         if progress_callback:
@@ -74,15 +102,55 @@ def get_easyocr_reader(progress_callback=None):
     if easyocr_reader is None:
         try:
             import easyocr
+            import signal
+            
             # Initialize EasyOCR reader (English only for now, can add more languages)
             # gpu=False for CPU, set gpu=True if CUDA is available
             # Note: First initialization downloads models (~500MB) and may take 2-5 minutes
             if progress_callback:
                 progress_callback("📥 Initializing EasyOCR (downloading models on first use - this may take 2-5 minutes)...")
-            easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
-            if progress_callback:
-                progress_callback("✓ EasyOCR reader initialized successfully")
-            print("✓ EasyOCR reader initialized successfully")
+            
+            # For Streamlit Cloud, use a simpler initialization that's more resilient
+            # Try to initialize with timeout handling
+            # For Streamlit Cloud, be more careful with initialization
+            if IS_STREAMLIT_CLOUD:
+                # On cloud, try to use cached models first to avoid timeout
+                try:
+                    easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False, download_enabled=False)
+                    if progress_callback:
+                        progress_callback("✓ EasyOCR reader initialized (using cached models)")
+                    print("✓ EasyOCR reader initialized with cached models (cloud mode)")
+                except Exception as cache_error:
+                    # If cached models don't work, try downloading (but this might timeout)
+                    print(f"⚠ Cached models not available, attempting download (may timeout on cloud)...")
+                    if progress_callback:
+                        progress_callback("📥 Downloading EasyOCR models (this may take 2-5 minutes, may timeout on cloud)...")
+                    try:
+                        easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False, download_enabled=True)
+                        if progress_callback:
+                            progress_callback("✓ EasyOCR reader initialized successfully")
+                        print("✓ EasyOCR reader initialized successfully (cloud mode)")
+                    except Exception as download_error:
+                        print(f"❌ EasyOCR download failed on cloud: {download_error}")
+                        raise download_error
+            else:
+                # Local environment - try download first
+                try:
+                    easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False, download_enabled=True)
+                    if progress_callback:
+                        progress_callback("✓ EasyOCR reader initialized successfully")
+                    print("✓ EasyOCR reader initialized successfully")
+                except Exception as init_error:
+                    # If initialization fails, try without download (models might already be cached)
+                    print(f"⚠ First EasyOCR init failed: {init_error}, trying cached models...")
+                    try:
+                        easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False, download_enabled=False)
+                        if progress_callback:
+                            progress_callback("✓ EasyOCR reader initialized (using cached models)")
+                        print("✓ EasyOCR reader initialized with cached models")
+                    except Exception as cache_error:
+                        raise init_error  # Raise original error
+                    
         except Exception as e:
             import traceback
             error_msg = f"EasyOCR initialization error: {e}"
@@ -91,6 +159,14 @@ def get_easyocr_reader(progress_callback=None):
             if progress_callback:
                 progress_callback(f"❌ {error_msg}")
             # Don't set to None permanently - allow retry on next call
+            # But limit retries to avoid infinite loops
+            if not hasattr(get_easyocr_reader, 'retry_count'):
+                get_easyocr_reader.retry_count = 0
+            get_easyocr_reader.retry_count += 1
+            if get_easyocr_reader.retry_count > 3:
+                print("❌ EasyOCR initialization failed after 3 attempts, disabling OCR")
+                global EASYOCR_AVAILABLE
+                EASYOCR_AVAILABLE = False
             return None
     return easyocr_reader
 
@@ -540,75 +616,264 @@ init_session_state()
 # ============================================================================
 
 def extract_text_from_docx(docx_file) -> Tuple[str, str]:
-    """Extract text from Word document - comprehensive extraction including tables, headers, footers"""
+    """Extract text from Word document - comprehensive extraction including tables, headers, footers, with OCR fallback"""
+    filename = "unknown.docx"
     try:
-        if not DOCX_AVAILABLE or Document_class is None:
-            return "", ""
-        
-        # Get filename
+        # Get filename first
         if hasattr(docx_file, 'name'):
             filename = docx_file.name
         elif isinstance(docx_file, str):
             filename = os.path.basename(docx_file)
-        else:
-            filename = "unknown.docx"
         
-        # Open document
-        if isinstance(docx_file, str):
-            # File path
-            doc = Document_class(docx_file)
-        else:
-            # File object
-            docx_file.seek(0)
-            doc = Document_class(io.BytesIO(docx_file.read()))
+        if not DOCX_AVAILABLE or Document_class is None:
+            print(f"⚠ Word library not available for {filename}")
+            return "", filename
+        
+        # Open document with better error handling
+        doc = None
+        file_path_for_ocr = None
+        try:
+            if isinstance(docx_file, str):
+                # File path
+                if not os.path.exists(docx_file):
+                    print(f"⚠ File not found: {docx_file}")
+                    return "", filename
+                file_path_for_ocr = docx_file
+                try:
+                    doc = Document_class(docx_file)
+                except Exception as open_error:
+                    print(f"⚠ Error opening Word document {filename} with python-docx: {open_error}")
+                    # Try OCR as fallback if document can't be opened normally
+                    if OCR_AVAILABLE:
+                        print(f"🔄 Attempting OCR extraction for {filename}...")
+                        return extract_text_from_docx_with_ocr(docx_file, filename)
+                    return "", filename
+            else:
+                # File object - save temporarily for OCR if needed
+                docx_file.seek(0)
+                file_bytes = docx_file.read()
+                if not file_bytes:
+                    print(f"⚠ Empty file: {filename}")
+                    return "", filename
+                try:
+                    doc = Document_class(io.BytesIO(file_bytes))
+                except Exception as open_error:
+                    print(f"⚠ Error opening Word document {filename} from file object: {open_error}")
+                    # Save to temp file for OCR
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp_file:
+                        tmp_file.write(file_bytes)
+                        file_path_for_ocr = tmp_file.name
+                    if OCR_AVAILABLE:
+                        print(f"🔄 Attempting OCR extraction for {filename}...")
+                        result = extract_text_from_docx_with_ocr(file_path_for_ocr, filename)
+                        try:
+                            os.unlink(file_path_for_ocr)
+                        except:
+                            pass
+                        return result
+                    return "", filename
+        except Exception as e:
+            print(f"❌ Unexpected error opening Word document {filename}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Try OCR as last resort
+            if OCR_AVAILABLE and file_path_for_ocr and os.path.exists(file_path_for_ocr):
+                try:
+                    return extract_text_from_docx_with_ocr(file_path_for_ocr, filename)
+                except:
+                    pass
+            return "", filename
+        
+        if doc is None:
+            return "", filename
         
         text_parts = []
         
         # 1. Extract text from all paragraphs
-        for paragraph in doc.paragraphs:
-            if paragraph.text.strip():
-                text_parts.append(paragraph.text.strip())
+        try:
+            for paragraph in doc.paragraphs:
+                para_text = paragraph.text.strip() if paragraph.text else ""
+                if para_text:
+                    text_parts.append(para_text)
+        except Exception as e:
+            print(f"⚠ Error extracting paragraphs: {e}")
         
         # 2. Extract text from tables
-        for table in doc.tables:
-            for row in table.rows:
-                row_text = []
-                for cell in row.cells:
-                    if cell.text.strip():
-                        row_text.append(cell.text.strip())
-                if row_text:
-                    text_parts.append(" | ".join(row_text))
+        try:
+            for table in doc.tables:
+                for row in table.rows:
+                    row_text = []
+                    for cell in row.cells:
+                        cell_text = cell.text.strip() if cell.text else ""
+                        if cell_text:
+                            row_text.append(cell_text)
+                    if row_text:
+                        text_parts.append(" | ".join(row_text))
+        except Exception as e:
+            print(f"⚠ Error extracting tables: {e}")
         
         # 3. Extract text from headers
-        for section in doc.sections:
-            if section.header:
-                for paragraph in section.header.paragraphs:
-                    if paragraph.text.strip():
-                        text_parts.append(paragraph.text.strip())
+        try:
+            for section in doc.sections:
+                if section.header:
+                    for paragraph in section.header.paragraphs:
+                        para_text = paragraph.text.strip() if paragraph.text else ""
+                        if para_text:
+                            text_parts.append(para_text)
+        except Exception as e:
+            print(f"⚠ Error extracting headers: {e}")
         
         # 4. Extract text from footers
-        for section in doc.sections:
-            if section.footer:
-                for paragraph in section.footer.paragraphs:
-                    if paragraph.text.strip():
-                        text_parts.append(paragraph.text.strip())
+        try:
+            for section in doc.sections:
+                if section.footer:
+                    for paragraph in section.footer.paragraphs:
+                        para_text = paragraph.text.strip() if paragraph.text else ""
+                        if para_text:
+                            text_parts.append(para_text)
+        except Exception as e:
+            print(f"⚠ Error extracting footers: {e}")
         
         # Combine all text
         text = "\n".join(text_parts)
         
-        # Clean text - preserve line breaks for better structure
-        if not text.strip():
-            return "", filename
+        # Log extraction results
+        if text.strip():
+            print(f"✓ Extracted {len(text)} characters from {filename} (paragraphs: {len([p for p in text_parts if p])})")
+        else:
+            print(f"⚠ No text extracted from {filename} - document may be empty, corrupted, or image-based")
+            # Check if document has any structure
+            try:
+                if doc:
+                    para_count = len(doc.paragraphs)
+                    table_count = len(doc.tables)
+                    print(f"   Document structure: {para_count} paragraphs, {table_count} tables")
+            except:
+                pass
+        
+        # If no text extracted, try OCR as fallback
+        if not text.strip() and OCR_AVAILABLE:
+            print(f"⚠ No text extracted from {filename}, attempting OCR...")
+            ocr_file_path = None
+            try:
+                if isinstance(docx_file, str):
+                    ocr_file_path = docx_file
+                else:
+                    # Save file object to temp file for OCR
+                    import tempfile
+                    docx_file.seek(0)
+                    file_bytes = docx_file.read()
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp_file:
+                        tmp_file.write(file_bytes)
+                        ocr_file_path = tmp_file.name
+                
+                if ocr_file_path and os.path.exists(ocr_file_path):
+                    ocr_text, _ = extract_text_from_docx_with_ocr(ocr_file_path, filename)
+                    # Clean up temp file if we created it
+                    if not isinstance(docx_file, str) and ocr_file_path != docx_file:
+                        try:
+                            os.unlink(ocr_file_path)
+                        except:
+                            pass
+                    if ocr_text and ocr_text.strip():
+                        print(f"✓ OCR extracted {len(ocr_text)} chars from {filename}")
+                        return ocr_text, filename
+            except Exception as e:
+                print(f"❌ OCR fallback failed for {filename}: {e}")
+                # Clean up temp file if we created it
+                if not isinstance(docx_file, str) and ocr_file_path and ocr_file_path != docx_file:
+                    try:
+                        os.unlink(ocr_file_path)
+                    except:
+                        pass
         
         return text, filename
     except ImportError:
-        return "", ""
+        print(f"❌ python-docx not available for {filename}")
+        return "", filename
     except Exception as e:
-        # Log error but don't show to user immediately - let it be handled by caller
+        # Log error with full traceback
         import traceback
-        print(f"Error extracting Word document: {str(e)}")
+        error_msg = f"Error extracting Word document {filename}: {str(e)}"
+        print(f"❌ {error_msg}")
         print(traceback.format_exc())
-        return "", filename if hasattr(docx_file, 'name') or isinstance(docx_file, str) else "unknown.docx"
+        # Try OCR as last resort if file path is available
+        if OCR_AVAILABLE and isinstance(docx_file, str) and os.path.exists(docx_file):
+            try:
+                return extract_text_from_docx_with_ocr(docx_file, filename)
+            except:
+                pass
+        return "", filename
+
+def extract_text_from_docx_with_ocr(docx_file_path: str, filename: str) -> Tuple[str, str]:
+    """Extract text from Word document using OCR (extract images and OCR them, or convert to PDF)"""
+    try:
+        if not OCR_AVAILABLE:
+            print(f"⚠ OCR not available for {filename}")
+            return "", filename
+        
+        ocr_texts = []
+        
+        # Method 1: Extract images from Word document and OCR them
+        if EASYOCR_AVAILABLE:
+            reader = get_easyocr_reader()
+            if reader:
+                try:
+                    import zipfile
+                    # Word documents are ZIP files
+                    with zipfile.ZipFile(docx_file_path, 'r') as docx_zip:
+                        # Find image files
+                        image_files = [f for f in docx_zip.namelist() if f.startswith('word/media/')]
+                        print(f"📷 Found {len(image_files)} images in {filename}")
+                        for img_file in image_files[:20]:  # Limit to first 20 images
+                            try:
+                                img_data = docx_zip.read(img_file)
+                                img = Image.open(io.BytesIO(img_data))
+                                import numpy as np
+                                img_array = np.array(img)
+                                results = reader.readtext(img_array, paragraph=True, detail=0)
+                                if results:
+                                    page_text = "\n".join(results)
+                                    if page_text.strip():
+                                        ocr_texts.append(page_text)
+                                        print(f"✓ OCR extracted text from image {img_file}")
+                            except Exception as img_error:
+                                print(f"⚠ Error processing image {img_file}: {img_error}")
+                                continue
+                except Exception as zip_error:
+                    print(f"⚠ Error reading Word document as ZIP: {zip_error}")
+        
+        # Method 3: Try Tesseract OCR on images if EasyOCR didn't work
+        if not ocr_texts and TESSERACT_AVAILABLE:
+            try:
+                import zipfile
+                with zipfile.ZipFile(docx_file_path, 'r') as docx_zip:
+                    image_files = [f for f in docx_zip.namelist() if f.startswith('word/media/')]
+                    for img_file in image_files[:10]:
+                        try:
+                            img_data = docx_zip.read(img_file)
+                            img = Image.open(io.BytesIO(img_data))
+                            ocr_text = pytesseract.image_to_string(img)
+                            if ocr_text and ocr_text.strip():
+                                ocr_texts.append(ocr_text)
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+        
+        if ocr_texts:
+            combined_text = "\n".join(ocr_texts)
+            print(f"✓ OCR extracted {len(combined_text)} total characters from {filename}")
+            return combined_text, filename
+        
+        print(f"⚠ No text extracted via OCR from {filename}")
+        return "", filename
+    except Exception as e:
+        import traceback
+        print(f"❌ Error in OCR extraction from Word {filename}: {e}")
+        print(traceback.format_exc())
+        return "", filename
 
 def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
     """Extract text from PDF file with improved error handling"""
@@ -1706,14 +1971,12 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
         return dir_docs
     
     # 1. Admin-managed PDFs from /admin_docs/ (always show)
-    admin_docs_dir = "admin_docs"
-    os.makedirs(admin_docs_dir, exist_ok=True)
-    documents.extend(scan_directory(admin_docs_dir, "Admin"))
+    os.makedirs(ADMIN_DOCS_DIR, exist_ok=True)
+    documents.extend(scan_directory(ADMIN_DOCS_DIR, "Admin"))
     
     # 2. User-uploaded PDFs from /uploads/ (filtered by user email)
     if user_email:
-        uploads_dir = "uploads"
-        os.makedirs(uploads_dir, exist_ok=True)
+        os.makedirs(UPLOADS_DIR, exist_ok=True)
         # Get user's documents from database
         table_name = get_table_name("pdf_resources")
         cursor = execute_query(f"""
@@ -1743,14 +2006,13 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
         
         # Also scan uploads directory for files with user email in filename
         user_email_clean = user_email.lower().replace('@', '_').replace('.', '_')
-        uploads_dir = "uploads"
-        if os.path.exists(uploads_dir):
+        if os.path.exists(UPLOADS_DIR):
             try:
-                for filename in os.listdir(uploads_dir):
+                for filename in os.listdir(UPLOADS_DIR):
                     if filename.lower().endswith(('.pdf', '.docx', '.doc')):
                         # Check if filename contains user email pattern
                         if user_email_clean in filename.lower():
-                            filepath = os.path.join(uploads_dir, filename)
+                            filepath = os.path.join(UPLOADS_DIR, filename)
                             if filepath not in [d['filepath'] for d in documents]:  # Avoid duplicates
                                 try:
                                     file_size = os.path.getsize(filepath)
@@ -1772,7 +2034,7 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
     return documents
 
 def extract_text_from_documents(document_paths: List[str], max_pages_per_doc: int = None, max_total_chars: int = None, progress_callback=None) -> str:
-    """Extract and combine text from multiple documents (no limits)"""
+    """Extract and combine text from multiple documents (no limits) - cloud-compatible"""
     combined_text = []
     total_chars = 0
     
@@ -1780,10 +2042,32 @@ def extract_text_from_documents(document_paths: List[str], max_pages_per_doc: in
         # Remove character limit check - process all documents fully
         # if max_total_chars and total_chars >= max_total_chars:
         #     break
+        
+        # Normalize path for cloud compatibility
+        if not os.path.isabs(doc_path):
+            # Try relative to base directory first
+            abs_path = os.path.join(BASE_DIR, doc_path)
+            if os.path.exists(abs_path):
+                doc_path = abs_path
+            # Also try just the filename in uploads/admin_docs
+            filename = os.path.basename(doc_path)
+            for base_dir in [UPLOADS_DIR, ADMIN_DOCS_DIR]:
+                test_path = os.path.join(base_dir, filename)
+                if os.path.exists(test_path):
+                    doc_path = test_path
+                    break
             
         if not os.path.exists(doc_path):
             if progress_callback:
-                progress_callback(f"Skipping {os.path.basename(doc_path)} (not found)...")
+                progress_callback(f"⚠ Skipping {os.path.basename(doc_path)} (not found at {doc_path})...")
+            print(f"⚠ File not found: {doc_path}")
+            continue
+        
+        # Check file permissions
+        if not os.access(doc_path, os.R_OK):
+            if progress_callback:
+                progress_callback(f"⚠ Skipping {os.path.basename(doc_path)} (permission denied)...")
+            print(f"⚠ Permission denied: {doc_path}")
             continue
         
         try:
@@ -1831,8 +2115,27 @@ def extract_text_from_documents(document_paths: List[str], max_pages_per_doc: in
                         if progress_callback:
                             progress_callback(f"✓ Extracted {len(text)} chars from {os.path.basename(doc_path)}")
                     else:
+                        # No text extracted - try OCR explicitly for Word documents
                         if progress_callback:
-                            progress_callback(f"⚠ No text found in {os.path.basename(doc_path)} - document may be empty or image-based")
+                            progress_callback(f"⚠ No text found in {os.path.basename(doc_path)}, attempting OCR...")
+                        if OCR_AVAILABLE:
+                            try:
+                                # Try OCR on embedded images in Word document
+                                ocr_text, _ = extract_text_from_docx_with_ocr(doc_path, os.path.basename(doc_path))
+                                if ocr_text and ocr_text.strip():
+                                    combined_text.append(ocr_text)
+                                    total_chars += len(ocr_text)
+                                    if progress_callback:
+                                        progress_callback(f"✓ OCR extracted {len(ocr_text)} chars from {os.path.basename(doc_path)}")
+                                else:
+                                    if progress_callback:
+                                        progress_callback(f"❌ Could not extract text from {os.path.basename(doc_path)} even with OCR")
+                            except Exception as e:
+                                if progress_callback:
+                                    progress_callback(f"❌ OCR failed for {os.path.basename(doc_path)}: {str(e)}")
+                        else:
+                            if progress_callback:
+                                progress_callback(f"⚠ No text found in {os.path.basename(doc_path)} - document may be empty or image-based (OCR not available)")
                 else:
                     if progress_callback:
                         progress_callback(f"⚠ Word library not available for {os.path.basename(doc_path)}")
@@ -3104,9 +3407,27 @@ elif page == "📄 Upload Reviewer":
                 if st.button("🔍 Preview Selected Documents", use_container_width=True):
                     selected_paths = [doc['filepath'] for doc in all_documents if st.session_state.document_selections.get(doc['filepath'], False)]
                     if selected_paths:
-                        with st.spinner("Extracting text from selected documents..."):
+                        # Verify files exist
+                        existing_paths = [p for p in selected_paths if os.path.exists(p)]
+                        if not existing_paths:
+                            st.error("❌ Selected documents not found on server. Please re-select documents.")
+                        else:
+                            progress_placeholder = st.empty()
+                            
+                            def update_preview_progress(msg):
+                                progress_placeholder.info(f"🔄 {msg}")
+                            
                             try:
-                                combined_text = extract_text_from_documents(selected_paths)
+                                update_preview_progress("Extracting text from selected documents...")
+                                combined_text = extract_text_from_documents(
+                                    existing_paths,
+                                    max_pages_per_doc=None,
+                                    max_total_chars=None,
+                                    progress_callback=update_preview_progress
+                                )
+                                
+                                progress_placeholder.empty()
+                                
                                 if combined_text and combined_text.strip():
                                     st.session_state.pdf_text = combined_text
                                     st.session_state.pdf_name = f"Combined from {selected_count} document(s)"
@@ -3119,17 +3440,64 @@ elif page == "📄 Upload Reviewer":
                                     if len(combined_text.strip()) < 50:
                                         st.warning("⚠️ Only a small amount of text was extracted. AI question generation may be limited.")
                                 else:
-                                    # Even if extraction fails, mark documents as selected/loaded
-                                    st.session_state.pdf_text = "SELECTED_DOCUMENTS_NO_TEXT"
-                                    st.session_state.pdf_name = f"{selected_count} document(s) selected (text extraction limited)"
-                                    st.warning("⚠️ No machine-readable text could be extracted from the selected documents. They may be scanned/image-based or protected.")
-                                    st.info("💡 The documents are still available in your library, but AI question generation may not work for them.")
+                                    # No text extracted - try OCR explicitly on each document
+                                    update_preview_progress("No text found, attempting OCR on all documents...")
+                                    ocr_texts = []
+                                    for doc_path in existing_paths:
+                                        try:
+                                            if doc_path.lower().endswith('.pdf'):
+                                                update_preview_progress(f"Running OCR on {os.path.basename(doc_path)}...")
+                                                ocr_text, _ = extract_text_from_pdf(doc_path)
+                                                if ocr_text and ocr_text.strip():
+                                                    ocr_texts.append(ocr_text)
+                                                    st.info(f"✓ OCR extracted {len(ocr_text)} chars from {os.path.basename(doc_path)}")
+                                            elif doc_path.lower().endswith(('.docx', '.doc')):
+                                                update_preview_progress(f"Running OCR on {os.path.basename(doc_path)}...")
+                                                ocr_text, _ = extract_text_from_docx_with_ocr(doc_path, os.path.basename(doc_path))
+                                                if ocr_text and ocr_text.strip():
+                                                    ocr_texts.append(ocr_text)
+                                                    st.info(f"✓ OCR extracted {len(ocr_text)} chars from {os.path.basename(doc_path)}")
+                                        except Exception as doc_error:
+                                            st.warning(f"⚠ OCR failed for {os.path.basename(doc_path)}: {str(doc_error)}")
+                                    
+                                    progress_placeholder.empty()
+                                    
+                                    if ocr_texts:
+                                        combined_text = "\n".join(ocr_texts)
+                                        st.session_state.pdf_text = combined_text
+                                        st.session_state.pdf_name = f"Combined from {selected_count} document(s) (OCR)"
+                                        st.success(f"✅ OCR extracted {len(combined_text)} characters from {selected_count} document(s)!")
+                                        with st.expander("📖 Preview (First 1000 characters)"):
+                                            st.text(combined_text[:1000] + "..." if len(combined_text) > 1000 else combined_text)
+                                        st.metric("Total Characters", f"{len(combined_text):,}")
+                                    else:
+                                        # Even if extraction fails, mark documents as selected/loaded
+                                        st.session_state.pdf_text = "SELECTED_DOCUMENTS_NO_TEXT"
+                                        st.session_state.pdf_name = f"{selected_count} document(s) selected (text extraction limited)"
+                                        st.error("❌ **No readable text could be extracted** from the selected documents, even with OCR.")
+                                        st.warning("""
+                                        **Possible reasons:**
+                                        - Documents are password-protected or encrypted
+                                        - Documents contain only images with no readable text
+                                        - Documents are corrupted or in an unsupported format
+                                        - OCR models may not be loaded (first-time setup can take 2-5 minutes)
+                                        
+                                        **Solutions:**
+                                        - Wait a few minutes and try again (EasyOCR downloads models on first use)
+                                        - Ensure documents are not password-protected
+                                        - Try uploading documents with machine-readable text
+                                        - Contact admin for assistance
+                                        """)
                             except Exception as e:
+                                progress_placeholder.empty()
                                 # Even on error, mark documents as selected
                                 st.session_state.pdf_text = "SELECTED_DOCUMENTS_ERROR"
                                 st.session_state.pdf_name = f"{selected_count} document(s) selected"
-                                st.warning(f"⚠️ Preview available, but some documents could not be fully processed: {str(e)}")
-                                st.info("💡 Documents are available for viewing. Some may be scanned PDFs that require OCR.")
+                                st.error(f"❌ **Error processing documents:** {str(e)}")
+                                import traceback
+                                with st.expander("🔍 Error Details"):
+                                    st.code(traceback.format_exc())
+                                st.info("💡 Documents are available in your library. Please check the error details above.")
     
     st.markdown("---")
     
@@ -3173,8 +3541,7 @@ elif page == "📄 Upload Reviewer":
                     st.session_state.last_processed_upload_id = file_id
 
                     # Save to uploads directory with user email in filename
-                    uploads_dir = "uploads"
-                    os.makedirs(uploads_dir, exist_ok=True)
+                    os.makedirs(UPLOADS_DIR, exist_ok=True)
 
                     # Generate unique filename with timestamp and user email
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3220,7 +3587,7 @@ elif page == "📄 Upload Reviewer":
                         )
                     else:
                         filename = f"{user_email_clean}{timestamp}_{uploaded_file.name}"
-                        file_path = os.path.join(uploads_dir, filename)
+                        file_path = os.path.join(UPLOADS_DIR, filename)
 
                         with open(file_path, "wb") as f:
                             f.write(uploaded_file.getbuffer())
@@ -4112,10 +4479,9 @@ elif page == "💳 Payment":
                     st.success("✅ Payment request submitted! Please send receipt to " + RECEIPT_EMAIL)
             else:
                 # Save receipt file
-                receipt_dir = "data/receipts"
-                os.makedirs(receipt_dir, exist_ok=True)
+                os.makedirs(RECEIPTS_DIR, exist_ok=True)
                 receipt_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{receipt_file.name}"
-                receipt_path = os.path.join(receipt_dir, receipt_filename)
+                receipt_path = os.path.join(RECEIPTS_DIR, receipt_filename)
                 
                 with open(receipt_path, "wb") as f:
                     f.write(receipt_file.getbuffer())
@@ -4287,7 +4653,7 @@ elif page == "🛠️ Admin Panel":
                     st.markdown(f"**Name:** {full_name} | **Email:** {email} | **Status:** {status}")
                     
                     if receipt_filename:
-                        receipt_path = os.path.join("data", "receipts", receipt_filename)
+                        receipt_path = os.path.join(RECEIPTS_DIR, receipt_filename)
                         if os.path.exists(receipt_path):
                             # Check if it's an image
                             if receipt_filename.lower().endswith(('.png', '.jpg', '.jpeg')):
@@ -4406,7 +4772,7 @@ elif page == "🛠️ Admin Panel":
                         db_conn.commit()
 
                     # Remove files from admin_docs and uploads directories
-                    for folder in ["admin_docs", "uploads"]:
+                    for folder in [ADMIN_DOCS_DIR, UPLOADS_DIR]:
                         if os.path.exists(folder):
                             for fname in os.listdir(folder):
                                 fpath = os.path.join(folder, fname)
@@ -4434,10 +4800,9 @@ elif page == "🛠️ Admin Panel":
             if st.form_submit_button("📤 Upload PDF", type="primary", use_container_width=True):
                 if uploaded_pdf:
                     # Save file to admin_docs directory
-                    pdf_dir = "admin_docs"
-                    os.makedirs(pdf_dir, exist_ok=True)
+                    os.makedirs(ADMIN_DOCS_DIR, exist_ok=True)
                     filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uploaded_pdf.name}"
-                    filepath = os.path.join(pdf_dir, filename)
+                    filepath = os.path.join(ADMIN_DOCS_DIR, filename)
                     
                     with open(filepath, "wb") as f:
                         f.write(uploaded_pdf.getbuffer())
