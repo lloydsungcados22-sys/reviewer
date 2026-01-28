@@ -1,18 +1,47 @@
+# Core dependencies
 pandas>=2.0.0
-pdfplumber>=0.10.0
-PyMuPDF>=1.23.0
-pytesseract>=0.3.10
-python-docx>=1.0.0
-reportlab>=4.0.0
-snowflake-connector-python>=3.0.0
+numpy>=1.24.0
 streamlit>=1.28.0
 Pillow>=10.0.0
 openai>=1.12.0
-easyocr>=1.7.0
-numpy>=1.24.0
+
+# Document processing (CRITICAL - must install)
+pdfplumber>=0.10.0
+PyMuPDF>=1.23.0
+python-docx>=1.0.0
+reportlab>=4.0.0
+
+# OCR support
+pytesseract>=0.3.10
 opencv-python-headless>=4.8.0
-torch>=2.0.0
-torchvision>=0.15.0
+
+# Database
+snowflake-connector-python>=3.0.0
+
+# EasyOCR and PyTorch (CPU versions - smaller size)
+# These are large packages (~1.5GB total). Installation may take 5-10 minutes.
+# If installation fails on Streamlit Cloud Community tier, these packages may be too large.
+# Alternative: Remove torch/torchvision/easyocr and use Tesseract OCR only (see requirements-no-ocr.txt)
+torch>=2.0.0,<2.2.0
+torchvision>=0.15.0,<0.17.0
+easyocr>=1.7.0
+
+# Note: EasyOCR downloads language models (~500MB) on first use, which may take 2-5 minutes
+# Tesseract OCR (optional fallback) requires system-level installation:
+# - Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki
+# - Linux: sudo apt-get install tesseract-ocr  
+# - macOS: brew install tesseract
+
+# STREAMLIT CLOUD DEPLOYMENT NOTES:
+# 1. Ensure this file is in the ROOT directory of your GitHub repository
+# 2. In Streamlit Cloud: Main file path = "app.py"
+# 3. If packages fail to install, check deployment logs in Streamlit Cloud dashboard
+# 4. If torch/torchvision installation fails due to size/timeout:
+#    - Try removing those 3 lines (torch, torchvision, easyocr)
+#    - Use requirements-no-ocr.txt instead (OCR will be disabled but app will work)
+# 5. First deployment may take 10-15 minutes due to large package downloads
+
+
 
 
 
