@@ -217,6 +217,89 @@ except ImportError as e:
     print(f"[WARNING] python-docx import failed: {e}")
     print("[ERROR] Word document processing will not work")
 
+
+def extract_text(uploaded_file) -> str:
+    """
+    Lightweight text extractor for Streamlit uploaded files.
+    - Reads bytes once to avoid "empty extraction" issues.
+    - Uses python-docx for DOCX.
+    - Uses pypdf first, then pdfplumber for PDFs.
+    - Returns empty string on failure.
+    """
+    if not uploaded_file:
+        return ""
+
+    # Get raw bytes from the uploader
+    try:
+        file_bytes = uploaded_file.getvalue()
+    except Exception:
+        try:
+            uploaded_file.seek(0)
+            file_bytes = uploaded_file.read()
+        except Exception:
+            return ""
+
+    filename = getattr(uploaded_file, "name", "") or ""
+    ext = os.path.splitext(filename.lower())[1]
+
+    # ---- DOCX ----
+    if ext == ".docx":
+        try:
+            from docx import Document
+        except Exception:
+            return ""
+
+        try:
+            doc = Document(io.BytesIO(file_bytes))
+            text = "\n".join([p.text for p in doc.paragraphs if p.text and p.text.strip()])
+            return text.strip()
+        except Exception:
+            return ""
+
+    # ---- DOC (old Word format) ----
+    if ext == ".doc":
+        # python-docx cannot reliably read legacy .doc files
+        return ""
+
+    # ---- PDF ----
+    if ext == ".pdf":
+        # Try pypdf first (fast, pure Python)
+        try:
+            from pypdf import PdfReader
+
+            reader = PdfReader(io.BytesIO(file_bytes))
+            page_texts = []
+            for page in reader.pages:
+                try:
+                    page_texts.append((page.extract_text() or ""))
+                except Exception:
+                    page_texts.append("")
+            text = "\n".join(page_texts).strip()
+            if len(text) >= 50:
+                return text
+        except Exception:
+            # Fall through to pdfplumber
+            pass
+
+        # Fallback: pdfplumber (already used elsewhere in the app)
+        try:
+            import pdfplumber
+
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                page_texts = []
+                for page in pdf.pages:
+                    try:
+                        page_texts.append((page.extract_text() or ""))
+                    except Exception:
+                        page_texts.append("")
+                text = "\n".join(page_texts).strip()
+            return text
+        except Exception:
+            return ""
+
+    # Unsupported extension
+    return ""
+
 # LLM for question generation (optional)
 try:
     import openai
@@ -3635,13 +3718,25 @@ elif page == "📄 Upload Reviewer":
                             except Exception:
                                 pass  # Continue even if database save fails
 
-                        # Extract text - try multiple methods for better success rate
+                        # Extract text - try lightweight in-memory helper first,
+                        # then fall back to the more advanced pipelines (with OCR).
                         file_ext = uploaded_file.name.lower().split(".")[-1] if uploaded_file.name else ""
                         text = ""
                         name = uploaded_file.name or "Uploaded Document"
                         
                         with st.spinner("📄 Extracting text from document... This may take a moment."):
-                            if file_ext == "pdf":
+                            # First attempt: simple extraction directly from the uploaded file object
+                            try:
+                                quick_text = extract_text(uploaded_file)
+                            except Exception:
+                                quick_text = ""
+
+                            if quick_text and quick_text.strip():
+                                text = quick_text.strip()
+                                name = uploaded_file.name or "Uploaded Document"
+
+                            # If simple extraction failed or was too short, use the existing pipelines
+                            if (not text or len(text.strip()) < 50) and file_ext == "pdf":
                                 # Try extracting from file object first
                                 uploaded_file.seek(0)
                                 text, name = extract_text_from_pdf(uploaded_file)
@@ -3664,7 +3759,7 @@ elif page == "📄 Upload Reviewer":
                                         text, name = extract_text_from_docx(file_path)
                                     except Exception:
                                         pass
-                            
+
                             # If still no text, try OCR for PDFs
                             if (not text or not text.strip()) and file_ext == "pdf" and OCR_AVAILABLE:
                                 try:
@@ -3672,6 +3767,14 @@ elif page == "📄 Upload Reviewer":
                                         text, name = extract_text_from_pdf(file_path)
                                 except Exception:
                                     pass
+
+                        # User-facing feedback similar to the standalone implementation
+                        if file_ext == "doc":
+                            st.error("This is a .DOC (old Word format). For best results, please convert it to a .DOCX and re-upload.")
+                        elif not text or len(text.strip()) < 50:
+                            st.warning("Text extraction failed or is too short. If this is a scanned PDF or image-heavy document, OCR may be required and results can vary.")
+                        else:
+                            st.success("Text extracted successfully from your document.")
 
                         if text and text.strip():
                             st.session_state.pdf_text = text
