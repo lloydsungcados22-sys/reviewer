@@ -63,21 +63,29 @@ import pandas as pd
 # PDF processing
 fitz_module = None
 pdfplumber_module = None
+PDF_AVAILABLE = False
+PDF_LIB = None
 OCR_AVAILABLE = False
+
 try:
     import fitz as fitz_module  # PyMuPDF
     PDF_AVAILABLE = True
     PDF_LIB = "fitz"
-except ImportError:
+    print("✓ PyMuPDF (fitz) imported successfully")
+except ImportError as e:
     fitz_module = None
+    print(f"⚠ PyMuPDF import failed: {e}")
     try:
         import pdfplumber as pdfplumber_module
         PDF_AVAILABLE = True
         PDF_LIB = "pdfplumber"
-    except ImportError:
+        print("✓ pdfplumber imported successfully")
+    except ImportError as e2:
         PDF_AVAILABLE = False
         PDF_LIB = None
         pdfplumber_module = None
+        print(f"⚠ pdfplumber import failed: {e2}")
+        print("❌ No PDF library available - PDF processing will not work")
 
 # Optional OCR support for scanned/image-based PDFs and documents
 EASYOCR_AVAILABLE = False
@@ -87,10 +95,14 @@ easyocr_reader = None
 try:
     import easyocr
     EASYOCR_AVAILABLE = True
+    print("✓ EasyOCR imported successfully")
     # Initialize EasyOCR reader lazily (on first use to avoid slow startup)
     # We'll initialize it when needed in the extraction function
-except Exception:
+except Exception as e:
     EASYOCR_AVAILABLE = False
+    print(f"⚠ EasyOCR import failed: {e}")
+    import traceback
+    print(traceback.format_exc())
 
 def get_easyocr_reader(progress_callback=None, timeout=300):
     """Get or initialize EasyOCR reader (lazy initialization with timeout for cloud)"""
@@ -181,19 +193,29 @@ try:
     from PIL import Image
     import pytesseract
     TESSERACT_AVAILABLE = True
-except Exception:
+    print("✓ Tesseract OCR (pytesseract) imported successfully")
+except Exception as e:
     TESSERACT_AVAILABLE = False
+    print(f"⚠ Tesseract OCR import failed: {e}")
 
 OCR_AVAILABLE = EASYOCR_AVAILABLE or TESSERACT_AVAILABLE
+if OCR_AVAILABLE:
+    print(f"✓ OCR available: EasyOCR={EASYOCR_AVAILABLE}, Tesseract={TESSERACT_AVAILABLE}")
+else:
+    print("❌ No OCR library available - scanned document processing will not work")
 
 # Word document processing
 Document_class = None
+DOCX_AVAILABLE = False
 try:
     from docx import Document as Document_class
     DOCX_AVAILABLE = True
-except ImportError:
+    print("✓ python-docx imported successfully")
+except ImportError as e:
     DOCX_AVAILABLE = False
     Document_class = None
+    print(f"⚠ python-docx import failed: {e}")
+    print("❌ Word document processing will not work")
 
 # LLM for question generation (optional)
 try:
@@ -3968,12 +3990,56 @@ elif page == "🧠 Practice Exam":
                                 st.write(f"**PDF Library:** {PDF_LIB}")
                                 st.write(f"**Word Library:** {DOCX_AVAILABLE}")
                                 
+                                # Check if packages are actually installed
+                                st.write("**Package Installation Status:**")
+                                packages_to_check = {
+                                    "PyMuPDF": "fitz",
+                                    "pdfplumber": "pdfplumber",
+                                    "python-docx": "docx",
+                                    "EasyOCR": "easyocr",
+                                    "pytesseract": "pytesseract",
+                                    "Pillow": "PIL"
+                                }
+                                
+                                for package_name, import_name in packages_to_check.items():
+                                    try:
+                                        __import__(import_name)
+                                        st.write(f"- {package_name}: ✓ Installed")
+                                    except ImportError as e:
+                                        st.write(f"- {package_name}: ✗ Not installed ({str(e)[:50]})")
+                                    except Exception as e:
+                                        st.write(f"- {package_name}: ⚠ Error ({str(e)[:50]})")
+                                
                                 # List document details
                                 st.write("**Document Details:**")
                                 for doc_path in selected_paths:
                                     exists = os.path.exists(doc_path)
                                     size = os.path.getsize(doc_path) if exists else 0
                                     st.write(f"- {os.path.basename(doc_path)}: {'✓ Exists' if exists else '✗ Not found'} ({size} bytes)")
+                                    
+                                    # Try to extract text directly to see what happens
+                                    if exists:
+                                        try:
+                                            if doc_path.lower().endswith('.pdf'):
+                                                if PDF_AVAILABLE:
+                                                    test_text, _ = extract_text_from_pdf(doc_path)
+                                                    if test_text:
+                                                        st.write(f"  - PDF extraction test: ✓ Success ({len(test_text)} chars)")
+                                                    else:
+                                                        st.write(f"  - PDF extraction test: ⚠ No text extracted")
+                                                else:
+                                                    st.write(f"  - PDF extraction test: ✗ PDF library not available")
+                                            elif doc_path.lower().endswith(('.docx', '.doc')):
+                                                if DOCX_AVAILABLE:
+                                                    test_text, _ = extract_text_from_docx(doc_path)
+                                                    if test_text:
+                                                        st.write(f"  - Word extraction test: ✓ Success ({len(test_text)} chars)")
+                                                    else:
+                                                        st.write(f"  - Word extraction test: ⚠ No text extracted")
+                                                else:
+                                                    st.write(f"  - Word extraction test: ✗ Word library not available")
+                                        except Exception as e:
+                                            st.write(f"  - Extraction test error: {str(e)[:100]}")
                             
                             st.warning("""
                             **Possible reasons:**
