@@ -94,15 +94,23 @@ except Exception:
 
 def get_easyocr_reader(progress_callback=None, timeout=300):
     """Get or initialize EasyOCR reader (lazy initialization with timeout for cloud)"""
-    global easyocr_reader, EASYOCR_AVAILABLE
+    global easyocr_reader
+    
+    # Check if EasyOCR is available (read-only check, no global needed)
     if not EASYOCR_AVAILABLE:
         if progress_callback:
             progress_callback("⚠ EasyOCR library not available")
         return None
+    
+    # Check if we've disabled EasyOCR due to too many failures
+    if hasattr(get_easyocr_reader, 'disabled') and get_easyocr_reader.disabled:
+        if progress_callback:
+            progress_callback("⚠ EasyOCR disabled due to repeated initialization failures")
+        return None
+    
     if easyocr_reader is None:
         try:
             import easyocr
-            import signal
             
             # Initialize EasyOCR reader (English only for now, can add more languages)
             # gpu=False for CPU, set gpu=True if CUDA is available
@@ -164,8 +172,8 @@ def get_easyocr_reader(progress_callback=None, timeout=300):
                 get_easyocr_reader.retry_count = 0
             get_easyocr_reader.retry_count += 1
             if get_easyocr_reader.retry_count > 3:
-                print("❌ EasyOCR initialization failed after 3 attempts, disabling OCR")
-                EASYOCR_AVAILABLE = False
+                print("❌ EasyOCR initialization failed after 3 attempts, disabling OCR for this session")
+                get_easyocr_reader.disabled = True
             return None
     return easyocr_reader
 
