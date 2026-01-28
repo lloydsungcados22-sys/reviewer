@@ -22,9 +22,7 @@ snowflake-connector-python>=3.0.0
 # These are large packages (~1.5GB total). Installation may take 5-10 minutes.
 # If installation fails on Streamlit Cloud Community tier, these packages may be too large.
 # Alternative: Remove torch/torchvision/easyocr and use Tesseract OCR only (see requirements-no-ocr.txt)
-torch>=2.0.0,<2.2.0
-torchvision>=0.15.0,<0.17.0
-easyocr>=1.7.0
+
 
 # Note: EasyOCR downloads language models (~500MB) on first use, which may take 2-5 minutes
 # Tesseract OCR (optional fallback) requires system-level installation:
@@ -46,6 +44,7 @@ python-docx
 pypdf
 pymupdf
 pillow
+
 
 
 
