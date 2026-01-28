@@ -1,56 +1,40 @@
-# Core dependencies
+## Unified requirements for both local development and Streamlit Cloud
+## This file MUST live at the repository root used by Streamlit Cloud.
+## It includes all libraries needed by:
+## - The PH Criminology Reviewer app (PDF/Word/OCR processing)
+## - The sample timesheet app in this workspace
+
+# Core
+streamlit>=1.28.0
 pandas>=2.0.0
 numpy>=1.24.0
-streamlit>=1.28.0
+
+# UI / plotting
+openpyxl>=3.1.0
+plotly>=5.0.0
 Pillow>=10.0.0
+
+# LLM / API
 openai>=1.12.0
 
-# Document processing (CRITICAL - must install)
+# Document processing (critical for reviewer app)
 pdfplumber>=0.10.0
 PyMuPDF>=1.23.0
 python-docx>=1.0.0
 reportlab>=4.0.0
 
-# OCR support
+# OCR (Tesseract-based, light enough for Cloud)
 pytesseract>=0.3.10
 opencv-python-headless>=4.8.0
 
 # Database
 snowflake-connector-python>=3.0.0
 
-# EasyOCR and PyTorch (CPU versions - smaller size)
-# These are large packages (~1.5GB total). Installation may take 5-10 minutes.
-# If installation fails on Streamlit Cloud Community tier, these packages may be too large.
-# Alternative: Remove torch/torchvision/easyocr and use Tesseract OCR only (see requirements-no-ocr.txt)
-
-
-# Note: EasyOCR downloads language models (~500MB) on first use, which may take 2-5 minutes
-# Tesseract OCR (optional fallback) requires system-level installation:
-# - Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki
-# - Linux: sudo apt-get install tesseract-ocr  
-# - macOS: brew install tesseract
-
-# STREAMLIT CLOUD DEPLOYMENT NOTES:
-# 1. Ensure this file is in the ROOT directory of your GitHub repository
-# 2. In Streamlit Cloud: Main file path = "app.py"
-# 3. If packages fail to install, check deployment logs in Streamlit Cloud dashboard
-# 4. If torch/torchvision installation fails due to size/timeout:
-#    - Try removing those 3 lines (torch, torchvision, easyocr)
-#    - Use requirements-no-ocr.txt instead (OCR will be disabled but app will work)
-# 5. First deployment may take 10-15 minutes due to large package downloads
-
-streamlit
-python-docx
-pypdf
-pymupdf
-pillow
-
-
-
-
-
-
-
-
-
-
+# NOTE ABOUT EASYOCR / TORCH
+# EasyOCR + PyTorch are intentionally NOT included here because they are
+# very large and often fail to install on Streamlit Cloud Community tier.
+# The app will still work using Tesseract OCR only. If you want EasyOCR
+# on a more powerful tier, add these manually in your own fork:
+#   torch>=2.0.0,<2.2.0
+#   torchvision>=0.15.0,<0.17.0
+#   easyocr>=1.7.0
