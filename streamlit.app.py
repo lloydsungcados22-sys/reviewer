@@ -3494,12 +3494,14 @@ elif page == "📄 Upload Reviewer":
                             if can_download and os.path.exists(doc_path):
                                 with open(doc_path, "rb") as f:
                                     file_data = f.read()
+                                    # Let Streamlit auto-generate a unique widget key.
+                                    # Explicit keys were causing StreamlitDuplicateElementKey
+                                    # when the same document path appeared more than once.
                                     st.download_button(
                                         "📥",
                                         data=file_data,
                                         file_name=doc['filename'],
                                         mime="application/pdf" if doc['type'] == "PDF" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                        key=f"dl_{doc_path}",
                                         help="Download this file"
                                     )
                             elif doc['source'] == "Admin":
