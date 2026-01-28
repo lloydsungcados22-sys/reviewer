@@ -42,7 +42,7 @@ for directory in [UPLOADS_DIR, ADMIN_DOCS_DIR, RECEIPTS_DIR]:
     try:
         os.makedirs(directory, exist_ok=True)
     except Exception as e:
-        print(f"⚠ Warning: Could not create directory {directory}: {e}")
+        print(f"[WARNING] Could not create directory {directory}: {e}")
 
 # Log cloud environment info for debugging (only in development)
 if IS_STREAMLIT_CLOUD:
@@ -71,21 +71,21 @@ try:
     import fitz as fitz_module  # PyMuPDF
     PDF_AVAILABLE = True
     PDF_LIB = "fitz"
-    print("✓ PyMuPDF (fitz) imported successfully")
+    print("[OK] PyMuPDF (fitz) imported successfully")
 except ImportError as e:
     fitz_module = None
-    print(f"⚠ PyMuPDF import failed: {e}")
+    print(f"[WARNING] PyMuPDF import failed: {e}")
     try:
         import pdfplumber as pdfplumber_module
         PDF_AVAILABLE = True
         PDF_LIB = "pdfplumber"
-        print("✓ pdfplumber imported successfully")
+        print("[OK] pdfplumber imported successfully")
     except ImportError as e2:
         PDF_AVAILABLE = False
         PDF_LIB = None
         pdfplumber_module = None
-        print(f"⚠ pdfplumber import failed: {e2}")
-        print("❌ No PDF library available - PDF processing will not work")
+        print(f"[WARNING] pdfplumber import failed: {e2}")
+        print("[ERROR] No PDF library available - PDF processing will not work")
 
 # Optional OCR support for scanned/image-based PDFs and documents
 EASYOCR_AVAILABLE = False
@@ -95,12 +95,12 @@ easyocr_reader = None
 try:
     import easyocr
     EASYOCR_AVAILABLE = True
-    print("✓ EasyOCR imported successfully")
+    print("[OK] EasyOCR imported successfully")
     # Initialize EasyOCR reader lazily (on first use to avoid slow startup)
     # We'll initialize it when needed in the extraction function
 except Exception as e:
     EASYOCR_AVAILABLE = False
-    print(f"⚠ EasyOCR import failed: {e}")
+    print(f"[WARNING] EasyOCR import failed: {e}")
     import traceback
     print(traceback.format_exc())
 
@@ -139,19 +139,19 @@ def get_easyocr_reader(progress_callback=None, timeout=300):
                     easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False, download_enabled=False)
                     if progress_callback:
                         progress_callback("✓ EasyOCR reader initialized (using cached models)")
-                    print("✓ EasyOCR reader initialized with cached models (cloud mode)")
+                    print("[OK] EasyOCR reader initialized with cached models (cloud mode)")
                 except Exception as cache_error:
                     # If cached models don't work, try downloading (but this might timeout)
-                    print(f"⚠ Cached models not available, attempting download (may timeout on cloud)...")
+                    print(f"[WARNING] Cached models not available, attempting download (may timeout on cloud)...")
                     if progress_callback:
                         progress_callback("📥 Downloading EasyOCR models (this may take 2-5 minutes, may timeout on cloud)...")
                     try:
                         easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False, download_enabled=True)
                         if progress_callback:
                             progress_callback("✓ EasyOCR reader initialized successfully")
-                        print("✓ EasyOCR reader initialized successfully (cloud mode)")
+                        print("[OK] EasyOCR reader initialized successfully (cloud mode)")
                     except Exception as download_error:
-                        print(f"❌ EasyOCR download failed on cloud: {download_error}")
+                        print(f"[ERROR] EasyOCR download failed on cloud: {download_error}")
                         raise download_error
             else:
                 # Local environment - try download first
@@ -159,22 +159,22 @@ def get_easyocr_reader(progress_callback=None, timeout=300):
                     easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False, download_enabled=True)
                     if progress_callback:
                         progress_callback("✓ EasyOCR reader initialized successfully")
-                    print("✓ EasyOCR reader initialized successfully")
+                    print("[OK] EasyOCR reader initialized successfully")
                 except Exception as init_error:
                     # If initialization fails, try without download (models might already be cached)
-                    print(f"⚠ First EasyOCR init failed: {init_error}, trying cached models...")
+                    print(f"[WARNING] First EasyOCR init failed: {init_error}, trying cached models...")
                     try:
                         easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False, download_enabled=False)
                         if progress_callback:
                             progress_callback("✓ EasyOCR reader initialized (using cached models)")
-                        print("✓ EasyOCR reader initialized with cached models")
+                        print("[OK] EasyOCR reader initialized with cached models")
                     except Exception as cache_error:
                         raise init_error  # Raise original error
                     
         except Exception as e:
             import traceback
             error_msg = f"EasyOCR initialization error: {e}"
-            print(f"❌ {error_msg}")
+            print(f"[ERROR] {error_msg}")
             print(traceback.format_exc())
             if progress_callback:
                 progress_callback(f"❌ {error_msg}")
@@ -184,7 +184,7 @@ def get_easyocr_reader(progress_callback=None, timeout=300):
                 get_easyocr_reader.retry_count = 0
             get_easyocr_reader.retry_count += 1
             if get_easyocr_reader.retry_count > 3:
-                print("❌ EasyOCR initialization failed after 3 attempts, disabling OCR for this session")
+                print("[ERROR] EasyOCR initialization failed after 3 attempts, disabling OCR for this session")
                 get_easyocr_reader.disabled = True
             return None
     return easyocr_reader
@@ -193,16 +193,16 @@ try:
     from PIL import Image
     import pytesseract
     TESSERACT_AVAILABLE = True
-    print("✓ Tesseract OCR (pytesseract) imported successfully")
+    print("[OK] Tesseract OCR (pytesseract) imported successfully")
 except Exception as e:
     TESSERACT_AVAILABLE = False
-    print(f"⚠ Tesseract OCR import failed: {e}")
+    print(f"[WARNING] Tesseract OCR import failed: {e}")
 
 OCR_AVAILABLE = EASYOCR_AVAILABLE or TESSERACT_AVAILABLE
 if OCR_AVAILABLE:
-    print(f"✓ OCR available: EasyOCR={EASYOCR_AVAILABLE}, Tesseract={TESSERACT_AVAILABLE}")
+    print(f"[OK] OCR available: EasyOCR={EASYOCR_AVAILABLE}, Tesseract={TESSERACT_AVAILABLE}")
 else:
-    print("❌ No OCR library available - scanned document processing will not work")
+    print("[ERROR] No OCR library available - scanned document processing will not work")
 
 # Word document processing
 Document_class = None
@@ -210,12 +210,12 @@ DOCX_AVAILABLE = False
 try:
     from docx import Document as Document_class
     DOCX_AVAILABLE = True
-    print("✓ python-docx imported successfully")
+    print("[OK] python-docx imported successfully")
 except ImportError as e:
     DOCX_AVAILABLE = False
     Document_class = None
-    print(f"⚠ python-docx import failed: {e}")
-    print("❌ Word document processing will not work")
+    print(f"[WARNING] python-docx import failed: {e}")
+    print("[ERROR] Word document processing will not work")
 
 # LLM for question generation (optional)
 try:
@@ -655,7 +655,7 @@ def extract_text_from_docx(docx_file) -> Tuple[str, str]:
             filename = os.path.basename(docx_file)
         
         if not DOCX_AVAILABLE or Document_class is None:
-            print(f"⚠ Word library not available for {filename}")
+            print(f"[WARNING] Word library not available for {filename}")
             return "", filename
         
         # Open document with better error handling
@@ -665,13 +665,13 @@ def extract_text_from_docx(docx_file) -> Tuple[str, str]:
             if isinstance(docx_file, str):
                 # File path
                 if not os.path.exists(docx_file):
-                    print(f"⚠ File not found: {docx_file}")
+                    print(f"[WARNING] File not found: {docx_file}")
                     return "", filename
                 file_path_for_ocr = docx_file
                 try:
                     doc = Document_class(docx_file)
                 except Exception as open_error:
-                    print(f"⚠ Error opening Word document {filename} with python-docx: {open_error}")
+                    print(f"[WARNING] Error opening Word document {filename} with python-docx: {open_error}")
                     # Try OCR as fallback if document can't be opened normally
                     if OCR_AVAILABLE:
                         print(f"🔄 Attempting OCR extraction for {filename}...")
@@ -682,12 +682,12 @@ def extract_text_from_docx(docx_file) -> Tuple[str, str]:
                 docx_file.seek(0)
                 file_bytes = docx_file.read()
                 if not file_bytes:
-                    print(f"⚠ Empty file: {filename}")
+                    print(f"[WARNING] Empty file: {filename}")
                     return "", filename
                 try:
                     doc = Document_class(io.BytesIO(file_bytes))
                 except Exception as open_error:
-                    print(f"⚠ Error opening Word document {filename} from file object: {open_error}")
+                    print(f"[WARNING] Error opening Word document {filename} from file object: {open_error}")
                     # Save to temp file for OCR
                     import tempfile
                     with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp_file:
@@ -703,7 +703,7 @@ def extract_text_from_docx(docx_file) -> Tuple[str, str]:
                         return result
                     return "", filename
         except Exception as e:
-            print(f"❌ Unexpected error opening Word document {filename}: {str(e)}")
+            print(f"[ERROR] Unexpected error opening Word document {filename}: {str(e)}")
             import traceback
             traceback.print_exc()
             # Try OCR as last resort
@@ -726,7 +726,7 @@ def extract_text_from_docx(docx_file) -> Tuple[str, str]:
                 if para_text:
                     text_parts.append(para_text)
         except Exception as e:
-            print(f"⚠ Error extracting paragraphs: {e}")
+            print(f"[WARNING] Error extracting paragraphs: {e}")
         
         # 2. Extract text from tables
         try:
@@ -740,7 +740,7 @@ def extract_text_from_docx(docx_file) -> Tuple[str, str]:
                     if row_text:
                         text_parts.append(" | ".join(row_text))
         except Exception as e:
-            print(f"⚠ Error extracting tables: {e}")
+            print(f"[WARNING] Error extracting tables: {e}")
         
         # 3. Extract text from headers
         try:
@@ -751,7 +751,7 @@ def extract_text_from_docx(docx_file) -> Tuple[str, str]:
                         if para_text:
                             text_parts.append(para_text)
         except Exception as e:
-            print(f"⚠ Error extracting headers: {e}")
+            print(f"[WARNING] Error extracting headers: {e}")
         
         # 4. Extract text from footers
         try:
@@ -762,16 +762,16 @@ def extract_text_from_docx(docx_file) -> Tuple[str, str]:
                         if para_text:
                             text_parts.append(para_text)
         except Exception as e:
-            print(f"⚠ Error extracting footers: {e}")
+            print(f"[WARNING] Error extracting footers: {e}")
         
         # Combine all text
         text = "\n".join(text_parts)
         
         # Log extraction results
         if text.strip():
-            print(f"✓ Extracted {len(text)} characters from {filename} (paragraphs: {len([p for p in text_parts if p])})")
+            print(f"[OK] Extracted {len(text)} characters from {filename} (paragraphs: {len([p for p in text_parts if p])})")
         else:
-            print(f"⚠ No text extracted from {filename} - document may be empty, corrupted, or image-based")
+            print(f"[WARNING] No text extracted from {filename} - document may be empty, corrupted, or image-based")
             # Check if document has any structure
             try:
                 if doc:
@@ -783,7 +783,7 @@ def extract_text_from_docx(docx_file) -> Tuple[str, str]:
         
         # If no text extracted, try OCR as fallback
         if not text.strip() and OCR_AVAILABLE:
-            print(f"⚠ No text extracted from {filename}, attempting OCR...")
+            print(f"[WARNING] No text extracted from {filename}, attempting OCR...")
             ocr_file_path = None
             try:
                 if isinstance(docx_file, str):
@@ -806,10 +806,10 @@ def extract_text_from_docx(docx_file) -> Tuple[str, str]:
                         except:
                             pass
                     if ocr_text and ocr_text.strip():
-                        print(f"✓ OCR extracted {len(ocr_text)} chars from {filename}")
+                        print(f"[OK] OCR extracted {len(ocr_text)} chars from {filename}")
                         return ocr_text, filename
             except Exception as e:
-                print(f"❌ OCR fallback failed for {filename}: {e}")
+                print(f"[ERROR] OCR fallback failed for {filename}: {e}")
                 # Clean up temp file if we created it
                 if not isinstance(docx_file, str) and ocr_file_path and ocr_file_path != docx_file:
                     try:
@@ -819,13 +819,13 @@ def extract_text_from_docx(docx_file) -> Tuple[str, str]:
         
         return text, filename
     except ImportError:
-        print(f"❌ python-docx not available for {filename}")
+        print(f"[ERROR] python-docx not available for {filename}")
         return "", filename
     except Exception as e:
         # Log error with full traceback
         import traceback
         error_msg = f"Error extracting Word document {filename}: {str(e)}"
-        print(f"❌ {error_msg}")
+        print(f"[ERROR] {error_msg}")
         print(traceback.format_exc())
         # Try OCR as last resort if file path is available
         if OCR_AVAILABLE and isinstance(docx_file, str) and os.path.exists(docx_file):
@@ -839,7 +839,7 @@ def extract_text_from_docx_with_ocr(docx_file_path: str, filename: str) -> Tuple
     """Extract text from Word document using OCR (extract images and OCR them, or convert to PDF)"""
     try:
         if not OCR_AVAILABLE:
-            print(f"⚠ OCR not available for {filename}")
+            print(f"[WARNING] OCR not available for {filename}")
             return "", filename
         
         ocr_texts = []
@@ -866,12 +866,12 @@ def extract_text_from_docx_with_ocr(docx_file_path: str, filename: str) -> Tuple
                                     page_text = "\n".join(results)
                                     if page_text.strip():
                                         ocr_texts.append(page_text)
-                                        print(f"✓ OCR extracted text from image {img_file}")
+                                        print(f"[OK] OCR extracted text from image {img_file}")
                             except Exception as img_error:
-                                print(f"⚠ Error processing image {img_file}: {img_error}")
+                                print(f"[WARNING] Error processing image {img_file}: {img_error}")
                                 continue
                 except Exception as zip_error:
-                    print(f"⚠ Error reading Word document as ZIP: {zip_error}")
+                    print(f"[WARNING] Error reading Word document as ZIP: {zip_error}")
         
         # Method 3: Try Tesseract OCR on images if EasyOCR didn't work
         if not ocr_texts and TESSERACT_AVAILABLE:
@@ -893,14 +893,14 @@ def extract_text_from_docx_with_ocr(docx_file_path: str, filename: str) -> Tuple
         
         if ocr_texts:
             combined_text = "\n".join(ocr_texts)
-            print(f"✓ OCR extracted {len(combined_text)} total characters from {filename}")
+            print(f"[OK] OCR extracted {len(combined_text)} total characters from {filename}")
             return combined_text, filename
         
-        print(f"⚠ No text extracted via OCR from {filename}")
+        print(f"[WARNING] No text extracted via OCR from {filename}")
         return "", filename
     except Exception as e:
         import traceback
-        print(f"❌ Error in OCR extraction from Word {filename}: {e}")
+        print(f"[ERROR] Error in OCR extraction from Word {filename}: {e}")
         print(traceback.format_exc())
         return "", filename
 
@@ -2089,14 +2089,14 @@ def extract_text_from_documents(document_paths: List[str], max_pages_per_doc: in
         if not os.path.exists(doc_path):
             if progress_callback:
                 progress_callback(f"⚠ Skipping {os.path.basename(doc_path)} (not found at {doc_path})...")
-            print(f"⚠ File not found: {doc_path}")
+            print(f"[WARNING] File not found: {doc_path}")
             continue
         
         # Check file permissions
         if not os.access(doc_path, os.R_OK):
             if progress_callback:
                 progress_callback(f"⚠ Skipping {os.path.basename(doc_path)} (permission denied)...")
-            print(f"⚠ Permission denied: {doc_path}")
+            print(f"[WARNING] Permission denied: {doc_path}")
             continue
         
         try:
