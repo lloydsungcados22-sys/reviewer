@@ -64,19 +64,33 @@ try:
 except Exception:
     EASYOCR_AVAILABLE = False
 
-def get_easyocr_reader():
+def get_easyocr_reader(progress_callback=None):
     """Get or initialize EasyOCR reader (lazy initialization)"""
     global easyocr_reader
     if not EASYOCR_AVAILABLE:
+        if progress_callback:
+            progress_callback("⚠ EasyOCR library not available")
         return None
     if easyocr_reader is None:
         try:
             import easyocr
             # Initialize EasyOCR reader (English only for now, can add more languages)
             # gpu=False for CPU, set gpu=True if CUDA is available
+            # Note: First initialization downloads models (~500MB) and may take 2-5 minutes
+            if progress_callback:
+                progress_callback("📥 Initializing EasyOCR (downloading models on first use - this may take 2-5 minutes)...")
             easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+            if progress_callback:
+                progress_callback("✓ EasyOCR reader initialized successfully")
+            print("✓ EasyOCR reader initialized successfully")
         except Exception as e:
-            print(f"EasyOCR initialization error: {e}")
+            import traceback
+            error_msg = f"EasyOCR initialization error: {e}"
+            print(f"❌ {error_msg}")
+            print(traceback.format_exc())
+            if progress_callback:
+                progress_callback(f"❌ {error_msg}")
+            # Don't set to None permanently - allow retry on next call
             return None
     return easyocr_reader
 
@@ -697,6 +711,7 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
                 
                 # Try EasyOCR first (better for scanned documents)
                 if EASYOCR_AVAILABLE:
+                    # Pass a simple progress callback if available
                     reader = get_easyocr_reader()
                     if reader:
                         try:
@@ -769,7 +784,45 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
                 print(traceback.format_exc())
                 pass
         
-        # If still no text extracted, return empty string but keep filename
+        # If still no text extracted, try one more time with more aggressive OCR
+        if not text or not text.strip():
+            # Last resort: try OCR on all pages if available
+            if OCR_AVAILABLE and fitz_module:
+                try:
+                    if isinstance(pdf_file, str):
+                        doc = fitz_module.open(pdf_file)
+                    else:
+                        pdf_file.seek(0)
+                        doc = fitz_module.open(stream=pdf_file.read(), filetype="pdf")
+                    
+                    # Try EasyOCR on first 10 pages as last resort
+                    if EASYOCR_AVAILABLE:
+                        reader = get_easyocr_reader()
+                        if reader:
+                            ocr_texts = []
+                            max_pages = min(10, len(doc))
+                            for page_idx in range(max_pages):
+                                try:
+                                    page = doc[page_idx]
+                                    zoom = 2.0
+                                    mat = fitz_module.Matrix(zoom, zoom)
+                                    pix = page.get_pixmap(matrix=mat)
+                                    img = Image.frombytes("RGB" if pix.alpha == 0 else "RGBA", 
+                                                         [pix.width, pix.height], pix.samples)
+                                    import numpy as np
+                                    img_array = np.array(img)
+                                    results = reader.readtext(img_array, paragraph=True, detail=0)
+                                    if results:
+                                        ocr_texts.append("\n".join(results))
+                                except Exception:
+                                    continue
+                            if ocr_texts:
+                                text = "\n".join(ocr_texts)
+                    doc.close()
+                except Exception:
+                    pass
+        
+        # If still no text, return empty but keep filename
         if not text or not text.strip():
             return "", filename
         
@@ -1740,24 +1793,46 @@ def extract_text_from_documents(document_paths: List[str], max_pages_per_doc: in
             if doc_path.lower().endswith('.pdf'):
                 if PDF_AVAILABLE:
                     text, _ = extract_text_from_pdf(doc_path)
-                    if text:
+                    if text and text.strip():
                         # No character limit - extract full document
                         combined_text.append(text)
                         total_chars += len(text)
                         if progress_callback:
                             progress_callback(f"✓ Extracted {len(text)} chars from {os.path.basename(doc_path)}")
+                    else:
+                        # No text extracted - try OCR explicitly
+                        if progress_callback:
+                            progress_callback(f"⚠ No text found in {os.path.basename(doc_path)}, attempting OCR...")
+                        # Force OCR attempt by calling extract_text_from_pdf again with OCR flag
+                        # The function should automatically try OCR if initial extraction fails
+                        if OCR_AVAILABLE:
+                            if progress_callback:
+                                progress_callback(f"🔍 Using OCR to extract text from {os.path.basename(doc_path)}...")
+                            # Try extraction again - OCR should be attempted automatically
+                            text, _ = extract_text_from_pdf(doc_path)
+                            if text and text.strip():
+                                combined_text.append(text)
+                                total_chars += len(text)
+                                if progress_callback:
+                                    progress_callback(f"✓ OCR extracted {len(text)} chars from {os.path.basename(doc_path)}")
+                            else:
+                                if progress_callback:
+                                    progress_callback(f"❌ Could not extract text from {os.path.basename(doc_path)} even with OCR")
                 else:
                     if progress_callback:
                         progress_callback(f"⚠ PDF library not available for {os.path.basename(doc_path)}")
             elif doc_path.lower().endswith(('.docx', '.doc')):
                 if DOCX_AVAILABLE:
                     text, _ = extract_text_from_docx(doc_path)
-                    if text:
+                    if text and text.strip():
                         # No character limit - extract full document
                         combined_text.append(text)
                         total_chars += len(text)
                         if progress_callback:
                             progress_callback(f"✓ Extracted {len(text)} chars from {os.path.basename(doc_path)}")
+                    else:
+                        if progress_callback:
+                            progress_callback(f"⚠ No text found in {os.path.basename(doc_path)} - document may be empty or image-based")
                 else:
                     if progress_callback:
                         progress_callback(f"⚠ Word library not available for {os.path.basename(doc_path)}")
@@ -3442,11 +3517,20 @@ elif page == "🧠 Practice Exam":
                         st.error("❌ **No documents selected.** Please go to **📄 Upload Reviewer** page and select documents from the Document Library to generate AI-powered questions.")
                         st.info("💡 **Advance** and **Premium** users must select documents to generate questions. No dummy questions are available.")
                     else:
+                        # Verify documents exist before extraction
+                        existing_paths = [p for p in selected_paths if os.path.exists(p)]
+                        if not existing_paths:
+                            update_progress("❌ Selected documents not found on server.")
+                            progress_container.empty()
+                            st.error("❌ **Selected documents not found.** The files may have been deleted or moved. Please re-select documents from the Document Library.")
+                        elif len(existing_paths) < len(selected_paths):
+                            update_progress(f"⚠ {len(selected_paths) - len(existing_paths)} document(s) not found, processing {len(existing_paths)} available document(s)...")
+                        
                         # Extract text from selected documents
-                        update_progress(f"📄 Reading {len(selected_paths)} selected document(s)...")
+                        update_progress(f"📄 Reading {len(existing_paths)} selected document(s)...")
                         try:
                             text_for_generation = extract_text_from_documents(
-                                selected_paths,
+                                existing_paths,
                                 max_pages_per_doc=None,  # No limit
                                 max_total_chars=None,  # No limit
                                 progress_callback=update_progress,
@@ -3458,11 +3542,33 @@ elif page == "🧠 Practice Exam":
                                 st.session_state.pdf_text = text_for_generation
                                 st.session_state.pdf_name = f"Combined from {len(selected_paths)} document(s)"
                             else:
-                                # No text extracted - will show error below, but mark documents as selected
-                                update_progress(f"⚠ No readable text extracted from documents")
-                                st.session_state.pdf_text = "SELECTED_DOCUMENTS_NO_TEXT"
-                                st.session_state.pdf_name = f"{len(selected_paths)} document(s) selected"
-                                text_for_generation = ""
+                                # No text extracted - try OCR explicitly on each document
+                                update_progress(f"⚠ No text found, attempting OCR on {len(selected_paths)} document(s)...")
+                                ocr_texts = []
+                                for doc_path in selected_paths:
+                                    if os.path.exists(doc_path):
+                                        try:
+                                            if doc_path.lower().endswith('.pdf'):
+                                                update_progress(f"🔍 Running OCR on {os.path.basename(doc_path)}...")
+                                                # Force OCR attempt
+                                                ocr_text, _ = extract_text_from_pdf(doc_path)
+                                                if ocr_text and ocr_text.strip():
+                                                    ocr_texts.append(ocr_text)
+                                                    update_progress(f"✓ OCR extracted {len(ocr_text)} chars from {os.path.basename(doc_path)}")
+                                        except Exception as e:
+                                            update_progress(f"❌ OCR failed for {os.path.basename(doc_path)}: {str(e)}")
+                                
+                                if ocr_texts:
+                                    text_for_generation = "\n".join(ocr_texts)
+                                    st.session_state.pdf_text = text_for_generation
+                                    st.session_state.pdf_name = f"Combined from {len(selected_paths)} document(s) (OCR)"
+                                    update_progress(f"✓ OCR extracted {len(text_for_generation)} total characters")
+                                else:
+                                    # Still no text - mark documents as selected but no text
+                                    update_progress(f"❌ No readable text extracted even with OCR")
+                                    st.session_state.pdf_text = "SELECTED_DOCUMENTS_NO_TEXT"
+                                    st.session_state.pdf_name = f"{len(selected_paths)} document(s) selected"
+                                    text_for_generation = ""
                         except Exception as e:
                             st.error(f"Error extracting documents: {str(e)}")
                             update_progress(f"❌ Error: {str(e)}")
@@ -3477,15 +3583,35 @@ elif page == "🧠 Practice Exam":
                             update_progress("❌ No readable text could be extracted from the selected documents.")
                             progress_container.empty()
                             st.error("❌ **Cannot generate questions:** No readable text was extracted from your selected documents.")
+                            
+                            # Diagnostic information
+                            with st.expander("🔍 Diagnostic Information"):
+                                st.write(f"**Documents selected:** {len(selected_paths)}")
+                                st.write(f"**Documents found:** {len([p for p in selected_paths if os.path.exists(p)])}")
+                                st.write(f"**OCR Available:** {OCR_AVAILABLE}")
+                                st.write(f"**EasyOCR Available:** {EASYOCR_AVAILABLE}")
+                                st.write(f"**Tesseract Available:** {TESSERACT_AVAILABLE}")
+                                st.write(f"**PDF Library:** {PDF_LIB}")
+                                st.write(f"**Word Library:** {DOCX_AVAILABLE}")
+                                
+                                # List document details
+                                st.write("**Document Details:**")
+                                for doc_path in selected_paths:
+                                    exists = os.path.exists(doc_path)
+                                    size = os.path.getsize(doc_path) if exists else 0
+                                    st.write(f"- {os.path.basename(doc_path)}: {'✓ Exists' if exists else '✗ Not found'} ({size} bytes)")
+                            
                             st.warning("""
                             **Possible reasons:**
                             - Documents are scanned/image-based (require OCR)
                             - Documents are password-protected or encrypted
                             - Documents contain only images with no text layer
+                            - OCR models may not be loaded (first-time setup can take several minutes)
                             
                             **Solutions:**
+                            - Wait a few minutes and try again (EasyOCR downloads models on first use)
                             - Try uploading documents with machine-readable text
-                            - Use OCR-enabled documents
+                            - Ensure documents are not password-protected
                             - Contact admin for assistance with document processing
                             """)
                             st.info("💡 **No dummy questions will be used.** Please fix your documents and try again.")
