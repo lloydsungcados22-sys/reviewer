@@ -22,4 +22,4 @@ snowflake-connector-python>=3.0.0
 # DO NOT include these on Streamlit Cloud Community; they cause installs to fail:
 # torch>=2.0.0,<2.2.0
 # torchvision>=0.15.0,<0.17.0
-# easyocr>=1.7.0
+easyocr>=1.7.0
