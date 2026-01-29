@@ -1262,7 +1262,7 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
         
         # If still no text extracted, try one more time with more aggressive OCR
         if not text or not text.strip():
-            # Last resort: try OCR on all pages if available
+            # Last resort: try OCR on first 10 pages (EasyOCR or Tesseract)
             if OCR_AVAILABLE and fitz_module:
                 try:
                     if isinstance(pdf_file, str):
@@ -1271,12 +1271,12 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
                         pdf_file.seek(0)
                         doc = fitz_module.open(stream=pdf_file.read(), filetype="pdf")
                     
-                    # Try EasyOCR on first 10 pages as last resort
+                    ocr_texts = []
+                    max_pages = min(10, len(doc))
+                    # Try EasyOCR first if available
                     if EASYOCR_AVAILABLE:
                         reader = get_easyocr_reader()
                         if reader:
-                            ocr_texts = []
-                            max_pages = min(10, len(doc))
                             for page_idx in range(max_pages):
                                 try:
                                     page = doc[page_idx]
@@ -1292,8 +1292,23 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
                                         ocr_texts.append("\n".join(results))
                                 except Exception:
                                     continue
-                            if ocr_texts:
-                                text = "\n".join(ocr_texts)
+                    # If no EasyOCR or it didn't return text, use Tesseract
+                    if not ocr_texts and TESSERACT_AVAILABLE:
+                        for page_idx in range(max_pages):
+                            try:
+                                page = doc[page_idx]
+                                zoom = 2.0
+                                mat = fitz_module.Matrix(zoom, zoom)
+                                pix = page.get_pixmap(matrix=mat)
+                                img = Image.frombytes("RGB" if pix.alpha == 0 else "RGBA", 
+                                                     [pix.width, pix.height], pix.samples)
+                                page_text = pytesseract.image_to_string(img, config='--psm 6')
+                                if page_text and page_text.strip():
+                                    ocr_texts.append(page_text)
+                            except Exception:
+                                continue
+                    if ocr_texts:
+                        text = "\n".join(ocr_texts)
                     doc.close()
                 except Exception:
                     pass
@@ -4314,14 +4329,12 @@ elif page == "🧠 Practice Exam":
         render_card("⚙️ Generate Questions", """
         <p>Configure your practice exam settings. Questions are generated using the <strong>OpenAI API</strong> from the text of your selected documents (PDF, Word, images) in the Document Library.</p>
         """)
-        st.info("🤖 **OpenAI API** is used to read your selected PDFs and images and generate questions. Ensure an API key is set in secrets (OPENAI_API_KEY).")
         col1, col2 = st.columns(2)
         with col1:
             difficulty = st.selectbox("Difficulty Level", ["Easy", "Average", "Difficult"])
             num_questions = st.number_input("Number of Questions", min_value=1, max_value=min(remaining, 6), value=min(6, remaining), help="Maximum 6 questions per practice exam")
         
         st.info("ℹ️ **Note:** You can generate up to 6 questions per practice exam. All questions will be Multiple Choice (MCQ) format only, based on your selected documents.")
-        st.warning("⚠️ **Disclaimer:** Questions are generated for review purposes only. Always verify with official references and latest PH laws. Maximum 6 questions per practice exam session.")
         
         with col2:
             question_types = st.multiselect(
@@ -4477,7 +4490,10 @@ elif page == "🧠 Practice Exam":
                             update_progress("❌ No readable text could be extracted from the selected documents.")
                             progress_container.empty()
                             st.error("❌ **Cannot generate questions:** No readable text was extracted from your selected documents.")
-                            
+                            if not EASYOCR_AVAILABLE and TESSERACT_AVAILABLE:
+                                st.info("💡 **Tip:** EasyOCR is not installed; the app is using Tesseract only. For better results with scanned PDFs and images, install EasyOCR: `pip install easyocr`")
+                            elif not EASYOCR_AVAILABLE and not TESSERACT_AVAILABLE:
+                                st.warning("⚠️ **No OCR installed.** Install at least one: `pip install easyocr` or install Tesseract and `pip install pytesseract`")
                             # Diagnostic information
                             with st.expander("🔍 Diagnostic Information"):
                                 st.write(f"**Documents selected:** {len(selected_paths)}")
@@ -4556,6 +4572,8 @@ elif page == "🧠 Practice Exam":
                             - OCR models may not be loaded (first-time setup can take several minutes)
                             
                             **Solutions:**
+                            - **Install EasyOCR** for better OCR (especially scanned PDFs/images): `pip install easyocr`
+                            - If using Tesseract only: ensure the **Tesseract executable** is installed and in your system PATH (e.g. on Windows install from https://github.com/UB-Mannheim/tesseract/wiki)
                             - Wait a few minutes and try again (EasyOCR downloads models on first use)
                             - Try uploading documents with machine-readable text
                             - Ensure documents are not password-protected
