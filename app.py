@@ -2024,7 +2024,7 @@ def generate_questions(text: str, difficulty: str, num_questions: int, question_
 
 @st.cache_data(ttl=60, show_spinner=False)  # Cache for 60 seconds, no spinner
 def get_document_library(user_email: Optional[str] = None, user_access_level: Optional[str] = None) -> List[Dict]:
-    """Scan and return documents from Admin (Advance/Premium only) and current user (filtered by email)."""
+    """Scan and return documents: Admin docs for all Advance/Premium users (existing and new); user docs filtered by email."""
     documents = []
     
     def scan_directory(directory: str, source: str, filter_email: Optional[str] = None) -> List[Dict]:
@@ -3528,8 +3528,10 @@ elif page == "📄 Upload Reviewer":
     with st.container():
         st.markdown("### 📚 Document Library")
         st.markdown("Select documents to include in exam generation. Content from selected documents will be combined.")
+        if st.session_state.user_access_level in ("Advance", "Premium"):
+            st.caption("📄 **Admin-uploaded documents** are visible to all Advance and Premium users (existing and new). Select the documents you want to use for question generation.")
         
-        # Get documents filtered by current user (admin docs only for Advance/Premium)
+        # Get documents filtered by current user (admin docs for all Advance/Premium; user docs by email)
         current_user_email = st.session_state.user_email if st.session_state.user_logged_in else None
         current_access_level = st.session_state.user_access_level if st.session_state.user_logged_in else None
         all_documents = get_document_library(user_email=current_user_email, user_access_level=current_access_level)
@@ -3571,7 +3573,7 @@ elif page == "📄 Upload Reviewer":
             
             st.markdown("---")
             
-            # Display documents with checkboxes
+            # Display documents with checkboxes — clearly show selected vs unselected
             for doc in all_documents:
                 doc_path = doc['filepath']
                 is_selected = st.session_state.document_selections.get(doc_path, True)
@@ -3583,6 +3585,23 @@ elif page == "📄 Upload Reviewer":
                     "Uploaded": "#007bff"
                 }
                 source_color = source_colors.get(doc['source'], "#6c757d")
+                
+                # Clear selected/unselected styling: colored left border and status label
+                border_color = "#28a745" if is_selected else "#6c757d"
+                bg_color = "rgba(40, 167, 69, 0.12)" if is_selected else "rgba(108, 117, 125, 0.08)"
+                status_text = "✓ Selected" if is_selected else "○ Not selected"
+                status_color = "#28a745" if is_selected else "#6c757d"
+                st.markdown(f"""
+                <div style="
+                    border-left: 4px solid {border_color};
+                    background: {bg_color};
+                    border-radius: 6px;
+                    padding: 0.4rem 0.6rem;
+                    margin-bottom: 0.25rem;
+                ">
+                    <span style="color: {status_color}; font-weight: 600; font-size: 0.85rem;">{status_text}</span>
+                </div>
+                """, unsafe_allow_html=True)
                 
                 with st.container():
                     col1, col2, col3, col4 = st.columns([0.5, 3, 2, 1])
