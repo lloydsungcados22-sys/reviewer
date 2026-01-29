@@ -2106,32 +2106,57 @@ def get_document_library(user_email: Optional[str] = None, user_access_level: Op
         return dir_docs
     
     # 1. Admin-managed PDFs — always include for Advance and Premium (existing and new users)
-    # Load from pdf_resources (filter in Python so we don't rely on SQL LIKE) and resolve path to current app's admin_docs
+    # Identify admin docs by uploader: uploaded_by = admin user (is_admin=1) or literal "admin"
     if user_access_level in ("Advance", "Premium"):
         os.makedirs(ADMIN_DOCS_DIR, exist_ok=True)
         admin_paths_seen = set()
         
-        # Primary: get ALL pdf_resources, then in Python keep only admin docs (filepath contains admin_docs)
         try:
-            table_name = get_table_name("pdf_resources")
+            users_table = get_table_name("users")
+            pdf_table = get_table_name("pdf_resources")
+            # Get admin user emails (users with is_admin = 1)
+            cursor = execute_query(f"""
+                SELECT email FROM {users_table} WHERE is_admin = 1
+            """)
+            admin_emails = [row[0].strip().lower() for row in cursor.fetchall() if row and row[0]]
+            cursor.close()
+            admin_emails = list(set(admin_emails))
+            admin_emails.append("admin")  # Legacy: uploads with uploaded_by = "admin"
+            
+            if not admin_emails:
+                admin_emails = ["admin"]
+            
             cols = get_table_columns("pdf_resources")
             has_dl_col = cols and "is_downloadable" in [c.lower() for c in cols]
             has_premium_col = cols and "is_premium_only" in [c.lower() for c in cols]
-            if has_dl_col and has_premium_col:
+            has_uploaded_by = cols and "uploaded_by" in [c.lower() for c in cols]
+            
+            if not has_uploaded_by:
+                # Fallback: filter by filepath containing admin_docs
                 cursor = execute_query(f"""
-                    SELECT filepath, filename, is_downloadable, is_premium_only FROM {table_name}
+                    SELECT filepath, filename, is_downloadable, is_premium_only FROM {pdf_table}
+                """) if (has_dl_col and has_premium_col) else execute_query(f"""
+                    SELECT filepath, filename FROM {pdf_table}
                 """)
+                all_rows = cursor.fetchall()
+                cursor.close()
+                admin_rows = [r for r in all_rows if r[0] and ("admin_docs" in (r[0] or "").lower())]
             else:
-                cursor = execute_query(f"""
-                    SELECT filepath, filename FROM {table_name}
-                """)
-            all_rows = cursor.fetchall()
-            cursor.close()
-            # Filter in Python: admin docs have filepath containing "admin_docs" (case-insensitive)
-            admin_rows = [
-                r for r in all_rows
-                if r[0] and ("admin_docs" in (r[0] or "").lower())
-            ]
+                # Primary: get pdf_resources where uploaded_by IN (admin emails)
+                placeholders = ", ".join(["%s"] * len(admin_emails))
+                if has_dl_col and has_premium_col:
+                    cursor = execute_query(f"""
+                        SELECT filepath, filename, is_downloadable, is_premium_only FROM {pdf_table}
+                        WHERE LOWER(TRIM(COALESCE(uploaded_by, ''))) IN ({placeholders})
+                    """, tuple(e.lower().strip() for e in admin_emails))
+                else:
+                    cursor = execute_query(f"""
+                        SELECT filepath, filename FROM {pdf_table}
+                        WHERE LOWER(TRIM(COALESCE(uploaded_by, ''))) IN ({placeholders})
+                    """, tuple(e.lower().strip() for e in admin_emails))
+                admin_rows = cursor.fetchall()
+                cursor.close()
+            
             for row in admin_rows:
                 doc_path = (row[0] or "").strip()
                 doc_filename = (row[1] or "").strip()
