@@ -261,6 +261,15 @@ def extract_text(uploaded_file) -> str:
         # python-docx cannot reliably read legacy .doc files
         return ""
 
+    # ---- Images (OCR) ----
+    if ext in ('.png', '.jpg', '.jpeg'):
+        try:
+            uploaded_file.seek(0)
+            text, _ = extract_text_from_image(uploaded_file)
+            return text or ""
+        except Exception:
+            return ""
+
     # ---- PDF ----
     if ext == ".pdf":
         # Try pypdf first (fast, pure Python)
@@ -593,9 +602,20 @@ def init_snowflake_tables():
                 created_at VARCHAR(50),
                 last_login VARCHAR(50),
                 premium_code_used VARCHAR(255),
-                is_admin INTEGER DEFAULT 0
+                is_admin INTEGER DEFAULT 0,
+                last_ip VARCHAR(45)
             )
         """)
+        
+        # Migration: add last_ip to users if table existed without it
+        try:
+            user_cols = get_table_columns("users")
+            if user_cols and "last_ip" not in [c.lower() for c in user_cols]:
+                cursor.execute(f"ALTER TABLE {get_table_name('users')} ADD COLUMN last_ip VARCHAR(45)")
+                if is_snowflake():
+                    db_conn.commit()
+        except Exception as _:
+            pass  # Column may already exist or DB doesn't support ALTER
         
         # PDF management table
         cursor.execute(f"""
@@ -987,6 +1007,85 @@ def extract_text_from_docx_with_ocr(docx_file_path: str, filename: str) -> Tuple
         print(traceback.format_exc())
         return "", filename
 
+# Supported document and image extensions (documents for library + question generation)
+DOC_EXTENSIONS = ('.pdf', '.docx', '.doc')
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg')
+ALL_DOC_AND_IMAGE_EXTENSIONS = DOC_EXTENSIONS + IMAGE_EXTENSIONS
+
+def extract_text_from_image(image_file, progress_callback=None) -> Tuple[str, str]:
+    """
+    Extract text from image file (PNG, JPG, JPEG) using OCR.
+    Uses EasyOCR first, then Tesseract fallback. Returns (text, filename).
+    """
+    filename = "unknown.png"
+    try:
+        if not OCR_AVAILABLE:
+            if progress_callback:
+                progress_callback("⚠ OCR not available for image files")
+            return "", filename
+
+        # Resolve path or bytes
+        if isinstance(image_file, str):
+            if not os.path.exists(image_file):
+                return "", os.path.basename(image_file)
+            filename = os.path.basename(image_file)
+            try:
+                img = Image.open(image_file)
+            except Exception as e:
+                print(f"[WARNING] Cannot open image {filename}: {e}")
+                return "", filename
+        else:
+            # File-like object (uploaded file)
+            filename = getattr(image_file, 'name', 'unknown.png') or 'unknown.png'
+            try:
+                image_file.seek(0)
+                img = Image.open(io.BytesIO(image_file.read()))
+            except Exception as e:
+                print(f"[WARNING] Cannot open image {filename}: {e}")
+                return "", filename
+
+        # Convert to RGB if necessary (e.g. RGBA, P mode)
+        if img.mode not in ('RGB', 'L'):
+            img = img.convert('RGB')
+        import numpy as np
+        img_array = np.array(img)
+
+        ocr_text = ""
+        # Try EasyOCR first (better for scanned documents and varied fonts)
+        if EASYOCR_AVAILABLE:
+            if progress_callback:
+                progress_callback(f"🔍 Reading image with OCR: {filename}...")
+            reader = get_easyocr_reader(progress_callback=progress_callback)
+            if reader:
+                try:
+                    results = reader.readtext(img_array, paragraph=True, detail=0)
+                    if results:
+                        ocr_text = "\n".join(results).strip()
+                        if progress_callback and ocr_text:
+                            progress_callback(f"✓ Extracted {len(ocr_text)} chars from {filename}")
+                except Exception as e:
+                    print(f"[WARNING] EasyOCR failed for {filename}: {e}")
+
+        # Fallback to Tesseract
+        if not ocr_text and TESSERACT_AVAILABLE:
+            if progress_callback:
+                progress_callback(f"🔍 Trying Tesseract OCR on {filename}...")
+            try:
+                ocr_text = pytesseract.image_to_string(img, config='--psm 6').strip()
+                if ocr_text and progress_callback:
+                    progress_callback(f"✓ Extracted {len(ocr_text)} chars from {filename}")
+            except Exception as e:
+                print(f"[WARNING] Tesseract failed for {filename}: {e}")
+
+        if ocr_text:
+            print(f"[OK] OCR extracted {len(ocr_text)} characters from {filename}")
+        return ocr_text, filename
+    except Exception as e:
+        import traceback
+        print(f"[ERROR] extract_text_from_image {filename}: {e}")
+        print(traceback.format_exc())
+        return "", filename
+
 def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
     """Extract text from PDF file with improved error handling"""
     try:
@@ -1163,7 +1262,7 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
         
         # If still no text extracted, try one more time with more aggressive OCR
         if not text or not text.strip():
-            # Last resort: try OCR on all pages if available
+            # Last resort: try OCR on first 10 pages (EasyOCR or Tesseract)
             if OCR_AVAILABLE and fitz_module:
                 try:
                     if isinstance(pdf_file, str):
@@ -1172,12 +1271,12 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
                         pdf_file.seek(0)
                         doc = fitz_module.open(stream=pdf_file.read(), filetype="pdf")
                     
-                    # Try EasyOCR on first 10 pages as last resort
+                    ocr_texts = []
+                    max_pages = min(10, len(doc))
+                    # Try EasyOCR first if available
                     if EASYOCR_AVAILABLE:
                         reader = get_easyocr_reader()
                         if reader:
-                            ocr_texts = []
-                            max_pages = min(10, len(doc))
                             for page_idx in range(max_pages):
                                 try:
                                     page = doc[page_idx]
@@ -1193,8 +1292,23 @@ def extract_text_from_pdf(pdf_file) -> Tuple[str, str]:
                                         ocr_texts.append("\n".join(results))
                                 except Exception:
                                     continue
-                            if ocr_texts:
-                                text = "\n".join(ocr_texts)
+                    # If no EasyOCR or it didn't return text, use Tesseract
+                    if not ocr_texts and TESSERACT_AVAILABLE:
+                        for page_idx in range(max_pages):
+                            try:
+                                page = doc[page_idx]
+                                zoom = 2.0
+                                mat = fitz_module.Matrix(zoom, zoom)
+                                pix = page.get_pixmap(matrix=mat)
+                                img = Image.frombytes("RGB" if pix.alpha == 0 else "RGBA", 
+                                                     [pix.width, pix.height], pix.samples)
+                                page_text = pytesseract.image_to_string(img, config='--psm 6')
+                                if page_text and page_text.strip():
+                                    ocr_texts.append(page_text)
+                            except Exception:
+                                continue
+                    if ocr_texts:
+                        text = "\n".join(ocr_texts)
                     doc.close()
                 except Exception:
                     pass
@@ -2011,9 +2125,38 @@ def generate_questions(text: str, difficulty: str, num_questions: int, question_
 # DOCUMENT LIBRARY MANAGEMENT
 # ============================================================================
 
+def _doc_type_from_filename(filename: str) -> str:
+    """Return display type: PDF, Word, or Image from filename."""
+    if not filename:
+        return "Document"
+    low = filename.lower()
+    if low.endswith('.pdf'):
+        return "PDF"
+    if low.endswith(('.docx', '.doc')):
+        return "Word"
+    if low.endswith(IMAGE_EXTENSIONS):
+        return "Image"
+    return "Document"
+
+def _mime_for_doc(doc: dict) -> str:
+    """Return MIME type for document download from doc dict (type + filename)."""
+    t = doc.get("type", "Document")
+    if t == "PDF":
+        return "application/pdf"
+    if t == "Word":
+        return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    if t == "Image":
+        fn = (doc.get("filename") or "").lower()
+        if fn.endswith(".png"):
+            return "image/png"
+        return "image/jpeg"
+    return "application/octet-stream"
+
 @st.cache_data(ttl=60, show_spinner=False)  # Cache for 60 seconds, no spinner
-def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
-    """Scan and return documents from Admin and current user only (filtered by email)"""
+def get_document_library(user_email: Optional[str] = None, user_access_level: Optional[str] = None) -> List[Dict]:
+    """Scan and return documents for the Document Library.
+    Admin-uploaded files are available to both Advance and Premium users.
+    User-uploaded docs are filtered by email. Returns list of {filename, filepath, source, type, ...}."""
     documents = []
     
     def scan_directory(directory: str, source: str, filter_email: Optional[str] = None) -> List[Dict]:
@@ -2023,7 +2166,7 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
             return dir_docs
         try:
             for filename in os.listdir(directory):
-                if filename.lower().endswith(('.pdf', '.docx', '.doc')):
+                if filename.lower().endswith(ALL_DOC_AND_IMAGE_EXTENSIONS):
                     filepath = os.path.join(directory, filename)
                     try:
                         # Check if file belongs to the user (email in filename or check database)
@@ -2049,22 +2192,33 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
                         file_size = os.path.getsize(filepath)
                         mtime = os.path.getmtime(filepath)
                         
-                        # Check database for downloadable status
+                        # Check database for downloadable and premium_only status (Admin docs)
                         is_downloadable = True  # Default
+                        is_premium_only = False  # Default
                         if source == "Admin":
                             columns_check = get_table_columns("pdf_resources")
                             has_downloadable_col = 'is_downloadable' in columns_check
-                            
+                            table_name = get_table_name("pdf_resources")
                             if has_downloadable_col:
-                                table_name = get_table_name("pdf_resources")
                                 cursor_check = execute_query(f"""
-                                    SELECT is_downloadable FROM {table_name} 
+                                    SELECT is_downloadable, is_premium_only FROM {table_name} 
                                     WHERE filepath = %s OR filename = %s
                                 """, (filepath, filename))
-                                result_check = cursor_check.fetchone()
-                                cursor_check.close()
-                                if result_check:
+                            else:
+                                cursor_check = execute_query(f"""
+                                    SELECT is_premium_only FROM {table_name} 
+                                    WHERE filepath = %s OR filename = %s
+                                """, (filepath, filename))
+                            result_check = cursor_check.fetchone()
+                            cursor_check.close()
+                            if result_check:
+                                if has_downloadable_col and len(result_check) >= 2:
                                     is_downloadable = bool(result_check[0])
+                                    is_premium_only = bool(result_check[1])
+                                elif has_downloadable_col:
+                                    is_downloadable = bool(result_check[0])
+                                else:
+                                    is_premium_only = bool(result_check[0])
                         
                         dir_docs.append({
                             "filename": filename,
@@ -2073,18 +2227,107 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
                             "date": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d"),
                             "size": file_size,
                             "size_mb": round(file_size / (1024 * 1024), 2),
-                            "type": "PDF" if filename.lower().endswith('.pdf') else "Word",
-                            "is_downloadable": is_downloadable
+                            "type": _doc_type_from_filename(filename),
+                            "is_downloadable": is_downloadable,
+                            "is_premium_only": is_premium_only if source == "Admin" else False
                         })
                     except (OSError, ValueError):
                         continue  # Skip files that can't be accessed
         except (OSError, PermissionError):
             pass  # Skip directories that can't be accessed
         return dir_docs
-    
-    # 1. Admin-managed PDFs from /admin_docs/ (always show)
-    os.makedirs(ADMIN_DOCS_DIR, exist_ok=True)
-    documents.extend(scan_directory(ADMIN_DOCS_DIR, "Admin"))
+
+    # 1. Admin-uploaded files — always include for Advance and Premium users in Document Library
+    # Identify admin docs by uploader: uploaded_by = admin user (is_admin=1) or literal "admin"
+    if user_access_level in ("Advance", "Premium"):
+        os.makedirs(ADMIN_DOCS_DIR, exist_ok=True)
+        admin_paths_seen = set()
+        
+        try:
+            users_table = get_table_name("users")
+            pdf_table = get_table_name("pdf_resources")
+            # Get admin user emails (users with is_admin = 1)
+            cursor = execute_query(f"""
+                SELECT email FROM {users_table} WHERE is_admin = 1
+            """)
+            admin_emails = [row[0].strip().lower() for row in cursor.fetchall() if row and row[0]]
+            cursor.close()
+            admin_emails = list(set(admin_emails))
+            admin_emails.append("admin")  # Legacy: uploads with uploaded_by = "admin"
+            
+            if not admin_emails:
+                admin_emails = ["admin"]
+            
+            cols = get_table_columns("pdf_resources")
+            has_dl_col = cols and "is_downloadable" in [c.lower() for c in cols]
+            has_premium_col = cols and "is_premium_only" in [c.lower() for c in cols]
+            has_uploaded_by = cols and "uploaded_by" in [c.lower() for c in cols]
+            
+            if not has_uploaded_by:
+                # Fallback: filter by filepath containing admin_docs
+                cursor = execute_query(f"""
+                    SELECT filepath, filename, is_downloadable, is_premium_only FROM {pdf_table}
+                """) if (has_dl_col and has_premium_col) else execute_query(f"""
+                    SELECT filepath, filename FROM {pdf_table}
+                """)
+                all_rows = cursor.fetchall()
+                cursor.close()
+                admin_rows = [r for r in all_rows if r[0] and ("admin_docs" in (r[0] or "").lower())]
+            else:
+                # Primary: get pdf_resources where uploaded_by IN (admin emails)
+                placeholders = ", ".join(["%s"] * len(admin_emails))
+                if has_dl_col and has_premium_col:
+                    cursor = execute_query(f"""
+                        SELECT filepath, filename, is_downloadable, is_premium_only FROM {pdf_table}
+                        WHERE LOWER(TRIM(COALESCE(uploaded_by, ''))) IN ({placeholders})
+                    """, tuple(e.lower().strip() for e in admin_emails))
+                else:
+                    cursor = execute_query(f"""
+                        SELECT filepath, filename FROM {pdf_table}
+                        WHERE LOWER(TRIM(COALESCE(uploaded_by, ''))) IN ({placeholders})
+                    """, tuple(e.lower().strip() for e in admin_emails))
+                admin_rows = cursor.fetchall()
+                cursor.close()
+            
+            for row in admin_rows:
+                doc_path = (row[0] or "").strip()
+                doc_filename = (row[1] or "").strip()
+                is_downloadable = bool(row[2]) if len(row) > 2 and has_dl_col else True
+                is_premium_only = bool(row[3]) if len(row) > 3 and has_premium_col else False
+                if not doc_filename or not doc_filename.lower().endswith(ALL_DOC_AND_IMAGE_EXTENSIONS):
+                    continue
+                # Resolve path: stored path may be from another machine; try current app's admin_docs
+                resolved_path = doc_path
+                if not os.path.exists(resolved_path):
+                    resolved_path = os.path.join(ADMIN_DOCS_DIR, os.path.basename(doc_path))
+                if not os.path.exists(resolved_path):
+                    resolved_path = os.path.join(ADMIN_DOCS_DIR, doc_filename)
+                if os.path.exists(resolved_path) and resolved_path not in admin_paths_seen:
+                    admin_paths_seen.add(resolved_path)
+                    try:
+                        file_size = os.path.getsize(resolved_path)
+                        mtime = os.path.getmtime(resolved_path)
+                        documents.append({
+                            "filename": doc_filename,
+                            "filepath": resolved_path,
+                            "source": "Admin",
+                            "date": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d"),
+                            "size": file_size,
+                            "size_mb": round(file_size / (1024 * 1024), 2),
+                            "type": _doc_type_from_filename(doc_filename),
+                            "is_downloadable": is_downloadable,
+                            "is_premium_only": is_premium_only
+                        })
+                    except (OSError, ValueError):
+                        continue
+        except Exception:
+            pass
+        
+        # Also scan admin_docs folder for any files not already in list (e.g. uploaded but not in DB yet)
+        admin_from_scan = scan_directory(ADMIN_DOCS_DIR, "Admin")
+        for d in admin_from_scan:
+            if d["filepath"] not in admin_paths_seen:
+                documents.append(d)
     
     # 2. User-uploaded PDFs from /uploads/ (filtered by user email)
     if user_email:
@@ -2111,7 +2354,7 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
                         "date": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d"),
                         "size": file_size,
                         "size_mb": round(file_size / (1024 * 1024), 2),
-                        "type": "PDF" if doc_filename.lower().endswith('.pdf') else "Word"
+                        "type": _doc_type_from_filename(doc_filename)
                     })
                 except (OSError, ValueError):
                     continue
@@ -2121,7 +2364,7 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
         if os.path.exists(UPLOADS_DIR):
             try:
                 for filename in os.listdir(UPLOADS_DIR):
-                    if filename.lower().endswith(('.pdf', '.docx', '.doc')):
+                    if filename.lower().endswith(ALL_DOC_AND_IMAGE_EXTENSIONS):
                         # Check if filename contains user email pattern
                         if user_email_clean in filename.lower():
                             filepath = os.path.join(UPLOADS_DIR, filename)
@@ -2136,7 +2379,7 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
                                         "date": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d"),
                                         "size": file_size,
                                         "size_mb": round(file_size / (1024 * 1024), 2),
-                                        "type": "PDF" if filename.lower().endswith('.pdf') else "Word"
+                                        "type": _doc_type_from_filename(filename)
                                     })
                                 except (OSError, ValueError):
                                     continue
@@ -2251,6 +2494,19 @@ def extract_text_from_documents(document_paths: List[str], max_pages_per_doc: in
                 else:
                     if progress_callback:
                         progress_callback(f"⚠ Word library not available for {os.path.basename(doc_path)}")
+            elif doc_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+                # Image files: extract text via OCR
+                if progress_callback:
+                    progress_callback(f"🔍 Reading image with OCR: {os.path.basename(doc_path)}...")
+                text, _ = extract_text_from_image(doc_path, progress_callback=progress_callback)
+                if text and text.strip():
+                    combined_text.append(text)
+                    total_chars += len(text)
+                    if progress_callback:
+                        progress_callback(f"✓ OCR extracted {len(text)} chars from {os.path.basename(doc_path)}")
+                else:
+                    if progress_callback:
+                        progress_callback(f"⚠ No text found in image {os.path.basename(doc_path)} (OCR returned empty)")
         except Exception as e:
             error_msg = f"Error processing {os.path.basename(doc_path)}: {str(e)}"
             if progress_callback:
@@ -2588,10 +2844,21 @@ def use_premium_code(code: str, session_id: str):
 # USER AUTHENTICATION & MANAGEMENT
 # ============================================================================
 
+def get_client_ip() -> Optional[str]:
+    """Get client IP address from request context (Streamlit). Returns None if unavailable (e.g. localhost)."""
+    try:
+        if hasattr(st, "context") and hasattr(st.context, "ip_address"):
+            ip = st.context.ip_address
+            return ip if ip else None
+    except Exception:
+        pass
+    return None
+
 def login_user(email: str) -> Tuple[bool, Dict]:
-    """Login user by email, create if doesn't exist"""
+    """Login user by email, create if doesn't exist. Tracks last login and client IP."""
     table_name = get_table_name("users")
     email = email.strip().lower()
+    client_ip = get_client_ip()
     
     # Check if user exists
     cursor = execute_query(f"""
@@ -2604,12 +2871,21 @@ def login_user(email: str) -> Tuple[bool, Dict]:
     cursor.close()
     
     if result:
-        # User exists, update last login
-        cursor = execute_query(f"""
-            UPDATE {table_name}
-            SET last_login = %s
-            WHERE email = %s
-        """, (datetime.now().isoformat(), email))
+        # User exists, update last login and last IP
+        user_cols = get_table_columns("users")
+        has_last_ip = user_cols and "last_ip" in [c.lower() for c in user_cols]
+        if has_last_ip and client_ip:
+            cursor = execute_query(f"""
+                UPDATE {table_name}
+                SET last_login = %s, last_ip = %s
+                WHERE email = %s
+            """, (datetime.now().isoformat(), client_ip, email))
+        else:
+            cursor = execute_query(f"""
+                UPDATE {table_name}
+                SET last_login = %s
+                WHERE email = %s
+            """, (datetime.now().isoformat(), email))
         cursor.close()
         
         if is_snowflake():
@@ -2624,10 +2900,18 @@ def login_user(email: str) -> Tuple[bool, Dict]:
         }
     else:
         # Create new user with Free access
-        cursor = execute_query(f"""
-            INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (email, "Free", 0, datetime.now().isoformat(), datetime.now().isoformat(), 0))
+        user_cols = get_table_columns("users")
+        has_last_ip = user_cols and "last_ip" in [c.lower() for c in user_cols]
+        if has_last_ip:
+            cursor = execute_query(f"""
+                INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin, last_ip)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (email, "Free", 0, datetime.now().isoformat(), datetime.now().isoformat(), 0, client_ip or ""))
+        else:
+            cursor = execute_query(f"""
+                INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (email, "Free", 0, datetime.now().isoformat(), datetime.now().isoformat(), 0))
         cursor.close()
         
         if is_snowflake():
@@ -3206,17 +3490,27 @@ def render_badge(text: str, color: str):
 @st.cache_data(ttl=120)  # Cache for 2 minutes
 @st.cache_data(ttl=300)
 def get_all_users_cached():
-    """Get all users for admin panel (cached)"""
+    """Get all users for admin panel (cached). Includes last_ip when column exists."""
     table_name = get_table_name("users")
-    cursor = execute_query(f"""
-        SELECT email, access_level, questions_answered, created_at, last_login, premium_code_used, is_admin
-        FROM {table_name}
-        ORDER BY created_at DESC
-    """)
+    user_cols = get_table_columns("users")
+    has_last_ip = user_cols and "last_ip" in [c.lower() for c in user_cols]
+    if has_last_ip:
+        cursor = execute_query(f"""
+            SELECT email, access_level, questions_answered, created_at, last_login, premium_code_used, is_admin, last_ip
+            FROM {table_name}
+            ORDER BY created_at DESC
+        """)
+    else:
+        cursor = execute_query(f"""
+            SELECT email, access_level, questions_answered, created_at, last_login, premium_code_used, is_admin
+            FROM {table_name}
+            ORDER BY created_at DESC
+        """)
     results = cursor.fetchall()
     cursor.close()
-    return [
-        {
+    out = []
+    for r in results:
+        row = {
             "email": r[0],
             "access_level": r[1],
             "questions_answered": r[2],
@@ -3225,25 +3519,33 @@ def get_all_users_cached():
             "premium_code_used": r[5] if len(r) > 5 else None,
             "is_admin": bool(r[6]) if len(r) > 6 else False
         }
-        for r in results
-    ]
+        if has_last_ip and len(r) > 7:
+            row["last_ip"] = r[7] or ""
+        else:
+            row["last_ip"] = ""
+        out.append(row)
+    return out
 
 # Inject theme
 inject_pnp_theme_css()
 render_header()
 
 # ============================================================================
-# SIDEBAR NAVIGATION
+# SIDEBAR NAVIGATION (page selector only when not logged in; after login use main-page cards)
 # ============================================================================
 
 with st.sidebar:
     st.markdown("### 🧭 NAVIGATION")
     
-    page = st.radio(
-        "Select Page",
-        ["🏠 Home", "📄 Upload Reviewer", "🧠 Practice Exam", "💳 Payment", "🛠️ Admin Panel"],
-        label_visibility="collapsed"
-    )
+    if st.session_state.user_logged_in:
+        page = st.session_state.get("current_page", "🏠 Home")
+        st.caption("Use the **cards on the main page** to switch sections.")
+    else:
+        page = st.radio(
+            "Select Page",
+            ["🏠 Home", "📄 Upload Reviewer", "🧠 Practice Exam", "💳 Payment", "🛠️ Admin Panel"],
+            label_visibility="collapsed"
+        )
     
     st.markdown("---")
     
@@ -3285,6 +3587,43 @@ with st.sidebar:
     st.caption("For review purposes only. Verify with latest PH laws.")
 
 # ============================================================================
+# CARD-STYLE NAVIGATION (main page, shown after login)
+# ============================================================================
+
+if st.session_state.user_logged_in:
+    nav_pages = [
+        ("🏠", "Home", "🏠 Home"),
+        ("📄", "Upload Reviewer", "📄 Upload Reviewer"),
+        ("🧠", "Practice Exam", "🧠 Practice Exam"),
+        ("💳", "Payment", "💳 Payment"),
+    ]
+    if st.session_state.get("admin_logged_in"):
+        nav_pages.append(("🛠️", "Admin Panel", "🛠️ Admin Panel"))
+    
+    cols = st.columns(len(nav_pages))
+    for i, (icon, label, page_value) in enumerate(nav_pages):
+        with cols[i]:
+            is_current = (page == page_value)
+            st.markdown(f"""
+            <div style="
+                background: linear-gradient(135deg, rgba(0, 51, 102, 0.25) 0%, rgba(0, 51, 102, 0.15) 100%);
+                border: 2px solid {'#d4af37' if is_current else 'rgba(212, 175, 55, 0.5)'};
+                border-radius: 12px;
+                padding: 1rem;
+                text-align: center;
+                margin-bottom: 0.5rem;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            ">
+                <div style="font-size: 1.8rem; margin-bottom: 0.25rem;">{icon}</div>
+                <div style="font-size: 0.85rem; font-weight: 600; color: #e0e0e0;">{label}</div>
+            </div>
+            """, unsafe_allow_html=True)
+            if st.button(f"Go to {label}", key=f"nav_{page_value}", use_container_width=True):
+                st.session_state.current_page = page_value
+                st.rerun()
+    st.markdown("---")
+
+# ============================================================================
 # PAGE: HOME
 # ============================================================================
 
@@ -3314,6 +3653,7 @@ if page == "🏠 Home":
                         st.session_state.premium_code_used = user_info.get("premium_code_used")
                         if user_info.get("is_admin"):
                             st.session_state.admin_logged_in = True
+                        st.session_state.show_credential_warning = True  # Show warning on next page load
                         
                         st.success(f"✅ Welcome, {user_info['email']}! Access Level: {user_info['access_level']}")
                         st.rerun()
@@ -3330,6 +3670,16 @@ if page == "🏠 Home":
         st.session_state.user_access_level = user_info["access_level"]
         st.session_state.questions_answered = user_info["questions_answered"]
         st.session_state.premium_active = (user_info["access_level"] == "Premium")
+    
+    # Show credential-sharing warning once after login
+    if st.session_state.get("show_credential_warning"):
+        st.warning("""
+        **⚠️ Keep your account secure**  
+        **Do not share your email or login credentials with anyone.**  
+        Access is tied to your account. Sharing credentials can lead to your access being blocked or restricted.  
+        Use only your own account from your own device.
+        """)
+        st.session_state.show_credential_warning = False
     
     # User profile card
     if st.session_state.user_access_level == "Premium":
@@ -3409,14 +3759,23 @@ elif page == "📄 Upload Reviewer":
     # Document Library Section
     with st.container():
         st.markdown("### 📚 Document Library")
-        st.markdown("Select documents to include in exam generation. Content from selected documents will be combined.")
+        st.markdown("Select documents to include in exam generation. Content from selected documents will be combined and sent to the **OpenAI API** to generate practice questions.")
+        if st.session_state.user_access_level in ("Advance", "Premium"):
+            st.caption("📄 **Admin-uploaded files** (PDF, Word, images) are available in the Document Library for **Advance** and **Premium** users. Select the documents you want the AI to read and use for question generation.")
         
-        # Get documents filtered by current user email
+        # Get documents: all admin-uploaded docs for Advance/Premium; user docs by email
         current_user_email = st.session_state.user_email if st.session_state.user_logged_in else None
-        all_documents = get_document_library(user_email=current_user_email)
+        current_access_level = st.session_state.user_access_level if st.session_state.user_logged_in else None
+        # Clear cache for Advance/Premium so admin docs from DB are always fresh when opening this page
+        if current_access_level in ("Advance", "Premium"):
+            get_document_library.clear()
+        all_documents = get_document_library(user_email=current_user_email, user_access_level=current_access_level)
         
         if not all_documents:
-            st.info("📭 No documents found. Upload documents below or ask admin to add documents.")
+            if st.session_state.user_access_level == "Free":
+                st.info("📭 **Document Library** is available for **Advance** and **Premium** users. Upgrade to access admin-uploaded documents and upload your own.")
+            else:
+                st.info("📭 No documents found. Upload documents below or ask admin to add documents.")
         else:
             # Initialize selected documents in session state
             if "document_selections" not in st.session_state:
@@ -3449,7 +3808,7 @@ elif page == "📄 Upload Reviewer":
             
             st.markdown("---")
             
-            # Display documents with checkboxes
+            # Display documents with checkboxes — status label must match checkbox (render status after checkbox)
             for doc in all_documents:
                 doc_path = doc['filepath']
                 is_selected = st.session_state.document_selections.get(doc_path, True)
@@ -3465,7 +3824,7 @@ elif page == "📄 Upload Reviewer":
                 with st.container():
                     col1, col2, col3, col4 = st.columns([0.5, 3, 2, 1])
                     with col1:
-                        # Use a more unique key to prevent duplicates - include index and hash of path
+                        # Checkbox first so we get current value; then status uses that value
                         doc_index = all_documents.index(doc)
                         doc_hash = hashlib.md5(doc_path.encode()).hexdigest()[:8]
                         unique_doc_key = f"doc_{doc_index}_{doc_hash}_{doc.get('source', 'unknown')}"
@@ -3477,36 +3836,61 @@ elif page == "📄 Upload Reviewer":
                     with col3:
                         st.markdown(f'<span style="background: {source_color}; color: white; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.8rem;">{doc["source"]}</span>', unsafe_allow_html=True)
                     with col4:
-                        # Show download status and button based on permissions
-                        if doc['source'] == "Admin" and doc.get('is_premium_only') and st.session_state.user_access_level != "Premium":
-                            st.markdown("🔒 Premium")
-                        elif doc['source'] == "Admin" and not doc.get('is_downloadable', True):
-                            st.markdown("👁️ Preview Only", help="This file is preview-only and cannot be downloaded")
-                        else:
-                            # Check if user owns the file or if it's downloadable
-                            can_download = True
-                            if doc['source'] == "Admin":
-                                can_download = doc.get('is_downloadable', True)
-                            elif doc['source'] == "Uploaded":
-                                # Users can always download their own files
-                                can_download = True
-                            
-                            if can_download and os.path.exists(doc_path):
+                        # Admin docs: download only for Premium; Advance can view/use but not download
+                        if doc['source'] == "Admin":
+                            can_download_admin = (
+                                st.session_state.user_access_level == "Premium"
+                                and doc.get('is_downloadable', True)
+                            )
+                            if not can_download_admin:
+                                if st.session_state.user_access_level == "Advance":
+                                    st.markdown("👁️ View only", help="Advance users can view and use; download is Premium only")
+                                else:
+                                    st.markdown("🔒 Premium", help="Upgrade to Premium to download")
+                            elif os.path.exists(doc_path):
                                 with open(doc_path, "rb") as f:
                                     file_data = f.read()
-                                    # Use a unique key per document to avoid
-                                    # StreamlitDuplicateElementId / Key issues.
                                     dl_key = f"dl_{unique_doc_key}"
                                     st.download_button(
                                         "📥",
                                         data=file_data,
                                         file_name=doc['filename'],
-                                        mime="application/pdf" if doc['type'] == "PDF" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                        mime=_mime_for_doc(doc),
                                         key=dl_key,
                                         help="Download this file"
                                     )
-                            elif doc['source'] == "Admin":
-                                st.markdown("👁️ Preview Only")
+                        else:
+                            # User-uploaded: owner can always download
+                            if os.path.exists(doc_path):
+                                with open(doc_path, "rb") as f:
+                                    file_data = f.read()
+                                    dl_key = f"dl_{unique_doc_key}"
+                                    st.download_button(
+                                        "📥",
+                                        data=file_data,
+                                        file_name=doc['filename'],
+                                        mime=_mime_for_doc(doc),
+                                        key=dl_key,
+                                        help="Download this file"
+                                    )
+                
+                # Status label after checkbox so it always matches: checked = Selected, unchecked = Not selected
+                display_selected = st.session_state.document_selections.get(doc_path, True)
+                border_color = "#28a745" if display_selected else "#6c757d"
+                bg_color = "rgba(40, 167, 69, 0.12)" if display_selected else "rgba(108, 117, 125, 0.08)"
+                status_text = "✓ Selected" if display_selected else "○ Not selected"
+                status_color = "#28a745" if display_selected else "#6c757d"
+                st.markdown(f"""
+                <div style="
+                    border-left: 4px solid {border_color};
+                    background: {bg_color};
+                    border-radius: 6px;
+                    padding: 0.4rem 0.6rem;
+                    margin-bottom: 0.5rem;
+                ">
+                    <span style="color: {status_color}; font-weight: 600; font-size: 0.85rem;">{status_text}</span>
+                </div>
+                """, unsafe_allow_html=True)
             
             st.markdown("---")
             
@@ -3569,6 +3953,12 @@ elif page == "📄 Upload Reviewer":
                                             elif doc_path.lower().endswith(('.docx', '.doc')):
                                                 update_preview_progress(f"Running OCR on {os.path.basename(doc_path)}...")
                                                 ocr_text, _ = extract_text_from_docx_with_ocr(doc_path, os.path.basename(doc_path))
+                                                if ocr_text and ocr_text.strip():
+                                                    ocr_texts.append(ocr_text)
+                                                    st.info(f"✓ OCR extracted {len(ocr_text)} chars from {os.path.basename(doc_path)}")
+                                            elif doc_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+                                                update_preview_progress(f"Reading image with OCR: {os.path.basename(doc_path)}...")
+                                                ocr_text, _ = extract_text_from_image(doc_path)
                                                 if ocr_text and ocr_text.strip():
                                                     ocr_texts.append(ocr_text)
                                                     st.info(f"✓ OCR extracted {len(ocr_text)} chars from {os.path.basename(doc_path)}")
@@ -3635,13 +4025,13 @@ elif page == "📄 Upload Reviewer":
                 <p style="color: #d4af37; margin: 1rem 0 0 0; font-weight: 600;">Go to <strong>💳 Payment</strong> page to upgrade!</p>
             </div>
             """, unsafe_allow_html=True)
-            st.file_uploader("Choose PDF or Word document", type=["pdf", "docx", "doc"], disabled=True, help="Upgrade to Advance or Premium to unlock document upload")
+            st.file_uploader("Choose document or image", type=["pdf", "docx", "doc", "png", "jpg", "jpeg"], disabled=True, help="Upgrade to Advance or Premium to unlock document upload")
             uploaded_file = None  # No file upload for Free users
         else:
             uploaded_file = st.file_uploader(
-                "Choose PDF or Word document",
-                type=["pdf", "docx", "doc"],
-                help="Upload your criminology reviewer PDF or Word document",
+                "Choose PDF, Word, or image (PNG/JPG)",
+                type=["pdf", "docx", "doc", "png", "jpg", "jpeg"],
+                help="Upload reviewer PDF, Word doc, or images (text in images is read via OCR for question generation)",
                 key=f"user_upload_{st.session_state.user_email or 'guest'}",
             )
 
@@ -3760,6 +4150,17 @@ elif page == "📄 Upload Reviewer":
                                 if not text or not text.strip():
                                     try:
                                         text, name = extract_text_from_docx(file_path)
+                                    except Exception:
+                                        pass
+
+                            elif file_ext in ["png", "jpg", "jpeg"]:
+                                # Images: extract text via OCR (file path is more reliable after save)
+                                with st.spinner("🔍 Reading image with OCR... This may take a moment."):
+                                    try:
+                                        text, name = extract_text_from_image(file_path)
+                                        if not text and uploaded_file:
+                                            uploaded_file.seek(0)
+                                            text, name = extract_text_from_image(uploaded_file)
                                     except Exception:
                                         pass
 
@@ -3926,16 +4327,14 @@ elif page == "🧠 Practice Exam":
     # Question generation form
     if not st.session_state.current_questions:
         render_card("⚙️ Generate Questions", """
-        <p>Configure your practice exam settings.</p>
+        <p>Configure your practice exam settings. Questions are generated using the <strong>OpenAI API</strong> from the text of your selected documents (PDF, Word, images) in the Document Library.</p>
         """)
-        
         col1, col2 = st.columns(2)
         with col1:
             difficulty = st.selectbox("Difficulty Level", ["Easy", "Average", "Difficult"])
             num_questions = st.number_input("Number of Questions", min_value=1, max_value=min(remaining, 6), value=min(6, remaining), help="Maximum 6 questions per practice exam")
         
         st.info("ℹ️ **Note:** You can generate up to 6 questions per practice exam. All questions will be Multiple Choice (MCQ) format only, based on your selected documents.")
-        st.warning("⚠️ **Disclaimer:** Questions are generated for review purposes only. Always verify with official references and latest PH laws. Maximum 6 questions per practice exam session.")
         
         with col2:
             question_types = st.multiselect(
@@ -4009,7 +4408,8 @@ elif page == "🧠 Practice Exam":
                     selected_paths = []
                     if "document_selections" in st.session_state:
                         current_user_email = st.session_state.user_email if st.session_state.user_logged_in else None
-                        all_docs = get_document_library(user_email=current_user_email)
+                        current_access_level = st.session_state.user_access_level if st.session_state.user_logged_in else None
+                        all_docs = get_document_library(user_email=current_user_email, user_access_level=current_access_level)
                         selected_paths = [doc['filepath'] for doc in all_docs if st.session_state.document_selections.get(doc['filepath'], False)]
                     
                     # CRITICAL: For Advance/Premium, require document selection - NO dummy questions
@@ -4052,8 +4452,13 @@ elif page == "🧠 Practice Exam":
                                         try:
                                             if doc_path.lower().endswith('.pdf'):
                                                 update_progress(f"🔍 Running OCR on {os.path.basename(doc_path)}...")
-                                                # Force OCR attempt
                                                 ocr_text, _ = extract_text_from_pdf(doc_path)
+                                                if ocr_text and ocr_text.strip():
+                                                    ocr_texts.append(ocr_text)
+                                                    update_progress(f"✓ OCR extracted {len(ocr_text)} chars from {os.path.basename(doc_path)}")
+                                            elif doc_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+                                                update_progress(f"🔍 Reading image with OCR: {os.path.basename(doc_path)}...")
+                                                ocr_text, _ = extract_text_from_image(doc_path)
                                                 if ocr_text and ocr_text.strip():
                                                     ocr_texts.append(ocr_text)
                                                     update_progress(f"✓ OCR extracted {len(ocr_text)} chars from {os.path.basename(doc_path)}")
@@ -4085,7 +4490,10 @@ elif page == "🧠 Practice Exam":
                             update_progress("❌ No readable text could be extracted from the selected documents.")
                             progress_container.empty()
                             st.error("❌ **Cannot generate questions:** No readable text was extracted from your selected documents.")
-                            
+                            if not EASYOCR_AVAILABLE and TESSERACT_AVAILABLE:
+                                st.info("💡 **Tip:** EasyOCR is not installed; the app is using Tesseract only. For better results with scanned PDFs and images, install EasyOCR: `pip install easyocr`")
+                            elif not EASYOCR_AVAILABLE and not TESSERACT_AVAILABLE:
+                                st.warning("⚠️ **No OCR installed.** Install at least one: `pip install easyocr` or install Tesseract and `pip install pytesseract`")
                             # Diagnostic information
                             with st.expander("🔍 Diagnostic Information"):
                                 st.write(f"**Documents selected:** {len(selected_paths)}")
@@ -4144,6 +4552,15 @@ elif page == "🧠 Practice Exam":
                                                         st.write(f"  - Word extraction test: ⚠ No text extracted")
                                                 else:
                                                     st.write(f"  - Word extraction test: ✗ Word library not available")
+                                            elif doc_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+                                                if OCR_AVAILABLE:
+                                                    test_text, _ = extract_text_from_image(doc_path)
+                                                    if test_text:
+                                                        st.write(f"  - Image OCR test: ✓ Success ({len(test_text)} chars)")
+                                                    else:
+                                                        st.write(f"  - Image OCR test: ⚠ No text extracted")
+                                                else:
+                                                    st.write(f"  - Image OCR test: ✗ OCR not available")
                                         except Exception as e:
                                             st.write(f"  - Extraction test error: {str(e)[:100]}")
                             
@@ -4155,6 +4572,8 @@ elif page == "🧠 Practice Exam":
                             - OCR models may not be loaded (first-time setup can take several minutes)
                             
                             **Solutions:**
+                            - **Install EasyOCR** for better OCR (especially scanned PDFs/images): `pip install easyocr`
+                            - If using Tesseract only: ensure the **Tesseract executable** is installed and in your system PATH (e.g. on Windows install from https://github.com/UB-Mannheim/tesseract/wiki)
                             - Wait a few minutes and try again (EasyOCR downloads models on first use)
                             - Try uploading documents with machine-readable text
                             - Ensure documents are not password-protected
@@ -4970,7 +5389,7 @@ elif page == "🛠️ Admin Panel":
         # Upload new PDF
         st.markdown("#### 📤 Upload New PDF")
         with st.form("upload_pdf_admin_tab4"):
-            uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf", "docx", "doc"], key="admin_pdf_upload_tab4")
+            uploaded_pdf = st.file_uploader("Upload PDF, Word, or image", type=["pdf", "docx", "doc", "png", "jpg", "jpeg"], key="admin_pdf_upload_tab4")
             is_premium_only = st.checkbox("Premium Only", value=False, help="Only Premium users can download this PDF")
             use_for_ai = st.checkbox("Use for AI Question Generation", value=True, help="Include this PDF in AI question generation")
             is_downloadable = st.checkbox("Allow Download", value=True, help="✅ Downloadable: Users can download this file | ❌ Preview-only: Users can only preview, not download")
@@ -5098,11 +5517,19 @@ elif page == "🛠️ Admin Panel":
                         if cursor.fetchone():
                             st.error(f"❌ User with email {new_user_email} already exists.")
                         else:
-                            # Create new user
-                            cursor = execute_query(f"""
-                                INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin)
-                                VALUES (%s, %s, %s, %s, %s, %s)
-                            """, (new_user_email.lower(), new_user_access, 0, datetime.now().isoformat(), datetime.now().isoformat(), 0))
+                            # Create new user (include last_ip if column exists)
+                            user_cols = get_table_columns("users")
+                            has_last_ip = user_cols and "last_ip" in [c.lower() for c in user_cols]
+                            if has_last_ip:
+                                cursor = execute_query(f"""
+                                    INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin, last_ip)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                """, (new_user_email.lower(), new_user_access, 0, datetime.now().isoformat(), datetime.now().isoformat(), 0, ""))
+                            else:
+                                cursor = execute_query(f"""
+                                    INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin)
+                                    VALUES (%s, %s, %s, %s, %s, %s)
+                                """, (new_user_email.lower(), new_user_access, 0, datetime.now().isoformat(), datetime.now().isoformat(), 0))
                             cursor.close()
                             if is_snowflake():
                                 db_conn.commit()
@@ -5123,7 +5550,7 @@ elif page == "🛠️ Admin Panel":
         
         if users_data:
             st.markdown("#### 📊 All Users")
-            # Build DataFrame from dict keys, then use friendly column titles
+            # Build DataFrame from dict keys, then use friendly column titles (includes Last IP)
             df = pd.DataFrame(users_data)
             df = df.rename(columns={
                 "email": "Email",
@@ -5131,7 +5558,14 @@ elif page == "🛠️ Admin Panel":
                 "questions_answered": "Questions Answered",
                 "created_at": "Created At",
                 "last_login": "Last Login",
+                "last_ip": "Last IP",
             })
+            # Ensure Last IP column is visible (reorder so it appears after Last Login)
+            if "Last IP" in df.columns:
+                cols = [c for c in df.columns if c != "Last IP"]
+                idx = cols.index("Last Login") + 1 if "Last Login" in cols else len(cols)
+                cols.insert(idx, "Last IP")
+                df = df[[c for c in cols if c in df.columns]]
             
             # Search
             search_email = st.text_input("🔍 Search User by Email", placeholder="Enter email to search")
