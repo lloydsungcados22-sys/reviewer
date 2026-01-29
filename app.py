@@ -2110,9 +2110,38 @@ def generate_questions(text: str, difficulty: str, num_questions: int, question_
 # DOCUMENT LIBRARY MANAGEMENT
 # ============================================================================
 
+def _doc_type_from_filename(filename: str) -> str:
+    """Return display type: PDF, Word, or Image from filename."""
+    if not filename:
+        return "Document"
+    low = filename.lower()
+    if low.endswith('.pdf'):
+        return "PDF"
+    if low.endswith(('.docx', '.doc')):
+        return "Word"
+    if low.endswith(IMAGE_EXTENSIONS):
+        return "Image"
+    return "Document"
+
+def _mime_for_doc(doc: dict) -> str:
+    """Return MIME type for document download from doc dict (type + filename)."""
+    t = doc.get("type", "Document")
+    if t == "PDF":
+        return "application/pdf"
+    if t == "Word":
+        return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    if t == "Image":
+        fn = (doc.get("filename") or "").lower()
+        if fn.endswith(".png"):
+            return "image/png"
+        return "image/jpeg"
+    return "application/octet-stream"
+
 @st.cache_data(ttl=60, show_spinner=False)  # Cache for 60 seconds, no spinner
 def get_document_library(user_email: Optional[str] = None, user_access_level: Optional[str] = None) -> List[Dict]:
-    """Scan and return documents: Admin docs for all Advance/Premium users (existing and new); user docs filtered by email."""
+    """Scan and return documents for the Document Library.
+    Admin-uploaded files are available to both Advance and Premium users.
+    User-uploaded docs are filtered by email. Returns list of {filename, filepath, source, type, ...}."""
     documents = []
     
     def scan_directory(directory: str, source: str, filter_email: Optional[str] = None) -> List[Dict]:
@@ -2193,34 +2222,7 @@ def get_document_library(user_email: Optional[str] = None, user_access_level: Op
             pass  # Skip directories that can't be accessed
         return dir_docs
 
-def _doc_type_from_filename(filename: str) -> str:
-    """Return display type: PDF, Word, or Image from filename."""
-    if not filename:
-        return "Document"
-    low = filename.lower()
-    if low.endswith('.pdf'):
-        return "PDF"
-    if low.endswith(('.docx', '.doc')):
-        return "Word"
-    if low.endswith(IMAGE_EXTENSIONS):
-        return "Image"
-    return "Document"
-
-def _mime_for_doc(doc: dict) -> str:
-    """Return MIME type for document download from doc dict (type + filename)."""
-    t = doc.get("type", "Document")
-    if t == "PDF":
-        return "application/pdf"
-    if t == "Word":
-        return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    if t == "Image":
-        fn = (doc.get("filename") or "").lower()
-        if fn.endswith(".png"):
-            return "image/png"
-        return "image/jpeg"
-    return "application/octet-stream"
-    
-    # 1. Admin-managed PDFs — always include for Advance and Premium (existing and new users)
+    # 1. Admin-uploaded files — always include for Advance and Premium users in Document Library
     # Identify admin docs by uploader: uploaded_by = admin user (is_admin=1) or literal "admin"
     if user_access_level in ("Advance", "Premium"):
         os.makedirs(ADMIN_DOCS_DIR, exist_ok=True)
@@ -3742,9 +3744,9 @@ elif page == "📄 Upload Reviewer":
     # Document Library Section
     with st.container():
         st.markdown("### 📚 Document Library")
-        st.markdown("Select documents to include in exam generation. Content from selected documents will be combined.")
+        st.markdown("Select documents to include in exam generation. Content from selected documents will be combined and sent to the **OpenAI API** to generate practice questions.")
         if st.session_state.user_access_level in ("Advance", "Premium"):
-            st.caption("📄 **Admin-uploaded documents** are visible to all Advance and Premium users (existing and new). Select the documents you want to use for question generation.")
+            st.caption("📄 **Admin-uploaded files** (PDF, Word, images) are available in the Document Library for **Advance** and **Premium** users. Select the documents you want the AI to read and use for question generation.")
         
         # Get documents: all admin-uploaded docs for Advance/Premium; user docs by email
         current_user_email = st.session_state.user_email if st.session_state.user_logged_in else None
@@ -4310,9 +4312,9 @@ elif page == "🧠 Practice Exam":
     # Question generation form
     if not st.session_state.current_questions:
         render_card("⚙️ Generate Questions", """
-        <p>Configure your practice exam settings.</p>
+        <p>Configure your practice exam settings. Questions are generated using the <strong>OpenAI API</strong> from the text of your selected documents (PDF, Word, images) in the Document Library.</p>
         """)
-        
+        st.info("🤖 **OpenAI API** is used to read your selected PDFs and images and generate questions. Ensure an API key is set in secrets (OPENAI_API_KEY).")
         col1, col2 = st.columns(2)
         with col1:
             difficulty = st.selectbox("Difficulty Level", ["Easy", "Average", "Difficult"])
