@@ -2106,12 +2106,12 @@ def get_document_library(user_email: Optional[str] = None, user_access_level: Op
         return dir_docs
     
     # 1. Admin-managed PDFs — always include for Advance and Premium (existing and new users)
-    # Use pdf_resources as source of truth (shared DB) and resolve path to current app's admin_docs
+    # Load from pdf_resources (filter in Python so we don't rely on SQL LIKE) and resolve path to current app's admin_docs
     if user_access_level in ("Advance", "Premium"):
         os.makedirs(ADMIN_DOCS_DIR, exist_ok=True)
         admin_paths_seen = set()
         
-        # Primary: load admin docs from pdf_resources (filepath contains admin_docs)
+        # Primary: get ALL pdf_resources, then in Python keep only admin docs (filepath contains admin_docs)
         try:
             table_name = get_table_name("pdf_resources")
             cols = get_table_columns("pdf_resources")
@@ -2120,18 +2120,21 @@ def get_document_library(user_email: Optional[str] = None, user_access_level: Op
             if has_dl_col and has_premium_col:
                 cursor = execute_query(f"""
                     SELECT filepath, filename, is_downloadable, is_premium_only FROM {table_name}
-                    WHERE filepath LIKE %s OR filepath LIKE %s
-                """, (f"%{os.path.basename(ADMIN_DOCS_DIR.rstrip(os.sep))}%", "%admin_docs%"))
+                """)
             else:
                 cursor = execute_query(f"""
                     SELECT filepath, filename FROM {table_name}
-                    WHERE filepath LIKE %s OR filepath LIKE %s
-                """, (f"%{os.path.basename(ADMIN_DOCS_DIR.rstrip(os.sep))}%", "%admin_docs%"))
-            admin_rows = cursor.fetchall()
+                """)
+            all_rows = cursor.fetchall()
             cursor.close()
+            # Filter in Python: admin docs have filepath containing "admin_docs" (case-insensitive)
+            admin_rows = [
+                r for r in all_rows
+                if r[0] and ("admin_docs" in (r[0] or "").lower())
+            ]
             for row in admin_rows:
-                doc_path = row[0]
-                doc_filename = row[1]
+                doc_path = (row[0] or "").strip()
+                doc_filename = (row[1] or "").strip()
                 is_downloadable = bool(row[2]) if len(row) > 2 and has_dl_col else True
                 is_premium_only = bool(row[3]) if len(row) > 3 and has_premium_col else False
                 if not doc_filename or not doc_filename.lower().endswith(('.pdf', '.docx', '.doc')):
