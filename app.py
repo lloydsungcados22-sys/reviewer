@@ -2105,10 +2105,41 @@ def get_document_library(user_email: Optional[str] = None, user_access_level: Op
             pass  # Skip directories that can't be accessed
         return dir_docs
     
-    # 1. Admin-managed PDFs from /admin_docs/ — only for Advance and Premium users
+    # 1. Admin-managed PDFs — always include for Advance and Premium (existing and new users)
     if user_access_level in ("Advance", "Premium"):
         os.makedirs(ADMIN_DOCS_DIR, exist_ok=True)
-        documents.extend(scan_directory(ADMIN_DOCS_DIR, "Admin"))
+        admin_from_scan = scan_directory(ADMIN_DOCS_DIR, "Admin")
+        documents.extend(admin_from_scan)
+        # Fallback: also include admin docs from pdf_resources (in case path differs or scan missed any)
+        try:
+            table_name = get_table_name("pdf_resources")
+            cursor = execute_query(f"""
+                SELECT filepath, filename FROM {table_name}
+                WHERE filepath LIKE %s OR filepath LIKE %s
+            """, (f"%{os.path.basename(ADMIN_DOCS_DIR.rstrip(os.sep))}%", "%admin_docs%"))
+            admin_rows = cursor.fetchall()
+            cursor.close()
+            existing_paths = {d["filepath"] for d in documents}
+            for doc_path, doc_filename in admin_rows:
+                if doc_path not in existing_paths and os.path.exists(doc_path) and doc_filename.lower().endswith(('.pdf', '.docx', '.doc')):
+                    try:
+                        file_size = os.path.getsize(doc_path)
+                        mtime = os.path.getmtime(doc_path)
+                        documents.append({
+                            "filename": doc_filename,
+                            "filepath": doc_path,
+                            "source": "Admin",
+                            "date": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d"),
+                            "size": file_size,
+                            "size_mb": round(file_size / (1024 * 1024), 2),
+                            "type": "PDF" if doc_filename.lower().endswith('.pdf') else "Word",
+                            "is_downloadable": True,
+                            "is_premium_only": False
+                        })
+                    except (OSError, ValueError):
+                        continue
+        except Exception:
+            pass
     
     # 2. User-uploaded PDFs from /uploads/ (filtered by user email)
     if user_email:
@@ -3531,7 +3562,7 @@ elif page == "📄 Upload Reviewer":
         if st.session_state.user_access_level in ("Advance", "Premium"):
             st.caption("📄 **Admin-uploaded documents** are visible to all Advance and Premium users (existing and new). Select the documents you want to use for question generation.")
         
-        # Get documents filtered by current user (admin docs for all Advance/Premium; user docs by email)
+        # Get documents: all admin-uploaded docs for Advance/Premium; user docs by email
         current_user_email = st.session_state.user_email if st.session_state.user_logged_in else None
         current_access_level = st.session_state.user_access_level if st.session_state.user_logged_in else None
         all_documents = get_document_library(user_email=current_user_email, user_access_level=current_access_level)
@@ -3573,7 +3604,7 @@ elif page == "📄 Upload Reviewer":
             
             st.markdown("---")
             
-            # Display documents with checkboxes — clearly show selected vs unselected
+            # Display documents with checkboxes — status label must match checkbox (render status after checkbox)
             for doc in all_documents:
                 doc_path = doc['filepath']
                 is_selected = st.session_state.document_selections.get(doc_path, True)
@@ -3586,27 +3617,10 @@ elif page == "📄 Upload Reviewer":
                 }
                 source_color = source_colors.get(doc['source'], "#6c757d")
                 
-                # Clear selected/unselected styling: colored left border and status label
-                border_color = "#28a745" if is_selected else "#6c757d"
-                bg_color = "rgba(40, 167, 69, 0.12)" if is_selected else "rgba(108, 117, 125, 0.08)"
-                status_text = "✓ Selected" if is_selected else "○ Not selected"
-                status_color = "#28a745" if is_selected else "#6c757d"
-                st.markdown(f"""
-                <div style="
-                    border-left: 4px solid {border_color};
-                    background: {bg_color};
-                    border-radius: 6px;
-                    padding: 0.4rem 0.6rem;
-                    margin-bottom: 0.25rem;
-                ">
-                    <span style="color: {status_color}; font-weight: 600; font-size: 0.85rem;">{status_text}</span>
-                </div>
-                """, unsafe_allow_html=True)
-                
                 with st.container():
                     col1, col2, col3, col4 = st.columns([0.5, 3, 2, 1])
                     with col1:
-                        # Use a more unique key to prevent duplicates - include index and hash of path
+                        # Checkbox first so we get current value; then status uses that value
                         doc_index = all_documents.index(doc)
                         doc_hash = hashlib.md5(doc_path.encode()).hexdigest()[:8]
                         unique_doc_key = f"doc_{doc_index}_{doc_hash}_{doc.get('source', 'unknown')}"
@@ -3655,6 +3669,24 @@ elif page == "📄 Upload Reviewer":
                                         key=dl_key,
                                         help="Download this file"
                                     )
+                
+                # Status label after checkbox so it always matches: checked = Selected, unchecked = Not selected
+                display_selected = st.session_state.document_selections.get(doc_path, True)
+                border_color = "#28a745" if display_selected else "#6c757d"
+                bg_color = "rgba(40, 167, 69, 0.12)" if display_selected else "rgba(108, 117, 125, 0.08)"
+                status_text = "✓ Selected" if display_selected else "○ Not selected"
+                status_color = "#28a745" if display_selected else "#6c757d"
+                st.markdown(f"""
+                <div style="
+                    border-left: 4px solid {border_color};
+                    background: {bg_color};
+                    border-radius: 6px;
+                    padding: 0.4rem 0.6rem;
+                    margin-bottom: 0.5rem;
+                ">
+                    <span style="color: {status_color}; font-weight: 600; font-size: 0.85rem;">{status_text}</span>
+                </div>
+                """, unsafe_allow_html=True)
             
             st.markdown("---")
             
