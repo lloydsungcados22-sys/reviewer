@@ -2012,8 +2012,8 @@ def generate_questions(text: str, difficulty: str, num_questions: int, question_
 # ============================================================================
 
 @st.cache_data(ttl=60, show_spinner=False)  # Cache for 60 seconds, no spinner
-def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
-    """Scan and return documents from Admin and current user only (filtered by email)"""
+def get_document_library(user_email: Optional[str] = None, user_access_level: Optional[str] = None) -> List[Dict]:
+    """Scan and return documents from Admin (Advance/Premium only) and current user (filtered by email)."""
     documents = []
     
     def scan_directory(directory: str, source: str, filter_email: Optional[str] = None) -> List[Dict]:
@@ -2049,22 +2049,33 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
                         file_size = os.path.getsize(filepath)
                         mtime = os.path.getmtime(filepath)
                         
-                        # Check database for downloadable status
+                        # Check database for downloadable and premium_only status (Admin docs)
                         is_downloadable = True  # Default
+                        is_premium_only = False  # Default
                         if source == "Admin":
                             columns_check = get_table_columns("pdf_resources")
                             has_downloadable_col = 'is_downloadable' in columns_check
-                            
+                            table_name = get_table_name("pdf_resources")
                             if has_downloadable_col:
-                                table_name = get_table_name("pdf_resources")
                                 cursor_check = execute_query(f"""
-                                    SELECT is_downloadable FROM {table_name} 
+                                    SELECT is_downloadable, is_premium_only FROM {table_name} 
                                     WHERE filepath = %s OR filename = %s
                                 """, (filepath, filename))
-                                result_check = cursor_check.fetchone()
-                                cursor_check.close()
-                                if result_check:
+                            else:
+                                cursor_check = execute_query(f"""
+                                    SELECT is_premium_only FROM {table_name} 
+                                    WHERE filepath = %s OR filename = %s
+                                """, (filepath, filename))
+                            result_check = cursor_check.fetchone()
+                            cursor_check.close()
+                            if result_check:
+                                if has_downloadable_col and len(result_check) >= 2:
                                     is_downloadable = bool(result_check[0])
+                                    is_premium_only = bool(result_check[1])
+                                elif has_downloadable_col:
+                                    is_downloadable = bool(result_check[0])
+                                else:
+                                    is_premium_only = bool(result_check[0])
                         
                         dir_docs.append({
                             "filename": filename,
@@ -2074,7 +2085,8 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
                             "size": file_size,
                             "size_mb": round(file_size / (1024 * 1024), 2),
                             "type": "PDF" if filename.lower().endswith('.pdf') else "Word",
-                            "is_downloadable": is_downloadable
+                            "is_downloadable": is_downloadable,
+                            "is_premium_only": is_premium_only if source == "Admin" else False
                         })
                     except (OSError, ValueError):
                         continue  # Skip files that can't be accessed
@@ -2082,9 +2094,10 @@ def get_document_library(user_email: Optional[str] = None) -> List[Dict]:
             pass  # Skip directories that can't be accessed
         return dir_docs
     
-    # 1. Admin-managed PDFs from /admin_docs/ (always show)
-    os.makedirs(ADMIN_DOCS_DIR, exist_ok=True)
-    documents.extend(scan_directory(ADMIN_DOCS_DIR, "Admin"))
+    # 1. Admin-managed PDFs from /admin_docs/ — only for Advance and Premium users
+    if user_access_level in ("Advance", "Premium"):
+        os.makedirs(ADMIN_DOCS_DIR, exist_ok=True)
+        documents.extend(scan_directory(ADMIN_DOCS_DIR, "Admin"))
     
     # 2. User-uploaded PDFs from /uploads/ (filtered by user email)
     if user_email:
@@ -3233,17 +3246,21 @@ inject_pnp_theme_css()
 render_header()
 
 # ============================================================================
-# SIDEBAR NAVIGATION
+# SIDEBAR NAVIGATION (page selector only when not logged in; after login use main-page cards)
 # ============================================================================
 
 with st.sidebar:
     st.markdown("### 🧭 NAVIGATION")
     
-    page = st.radio(
-        "Select Page",
-        ["🏠 Home", "📄 Upload Reviewer", "🧠 Practice Exam", "💳 Payment", "🛠️ Admin Panel"],
-        label_visibility="collapsed"
-    )
+    if st.session_state.user_logged_in:
+        page = st.session_state.get("current_page", "🏠 Home")
+        st.caption("Use the **cards on the main page** to switch sections.")
+    else:
+        page = st.radio(
+            "Select Page",
+            ["🏠 Home", "📄 Upload Reviewer", "🧠 Practice Exam", "💳 Payment", "🛠️ Admin Panel"],
+            label_visibility="collapsed"
+        )
     
     st.markdown("---")
     
@@ -3283,6 +3300,43 @@ with st.sidebar:
     
     st.markdown("---")
     st.caption("For review purposes only. Verify with latest PH laws.")
+
+# ============================================================================
+# CARD-STYLE NAVIGATION (main page, shown after login)
+# ============================================================================
+
+if st.session_state.user_logged_in:
+    nav_pages = [
+        ("🏠", "Home", "🏠 Home"),
+        ("📄", "Upload Reviewer", "📄 Upload Reviewer"),
+        ("🧠", "Practice Exam", "🧠 Practice Exam"),
+        ("💳", "Payment", "💳 Payment"),
+    ]
+    if st.session_state.get("admin_logged_in"):
+        nav_pages.append(("🛠️", "Admin Panel", "🛠️ Admin Panel"))
+    
+    cols = st.columns(len(nav_pages))
+    for i, (icon, label, page_value) in enumerate(nav_pages):
+        with cols[i]:
+            is_current = (page == page_value)
+            st.markdown(f"""
+            <div style="
+                background: linear-gradient(135deg, rgba(0, 51, 102, 0.25) 0%, rgba(0, 51, 102, 0.15) 100%);
+                border: 2px solid {'#d4af37' if is_current else 'rgba(212, 175, 55, 0.5)'};
+                border-radius: 12px;
+                padding: 1rem;
+                text-align: center;
+                margin-bottom: 0.5rem;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            ">
+                <div style="font-size: 1.8rem; margin-bottom: 0.25rem;">{icon}</div>
+                <div style="font-size: 0.85rem; font-weight: 600; color: #e0e0e0;">{label}</div>
+            </div>
+            """, unsafe_allow_html=True)
+            if st.button(f"Go to {label}", key=f"nav_{page_value}", use_container_width=True):
+                st.session_state.current_page = page_value
+                st.rerun()
+    st.markdown("---")
 
 # ============================================================================
 # PAGE: HOME
@@ -3411,12 +3465,16 @@ elif page == "📄 Upload Reviewer":
         st.markdown("### 📚 Document Library")
         st.markdown("Select documents to include in exam generation. Content from selected documents will be combined.")
         
-        # Get documents filtered by current user email
+        # Get documents filtered by current user (admin docs only for Advance/Premium)
         current_user_email = st.session_state.user_email if st.session_state.user_logged_in else None
-        all_documents = get_document_library(user_email=current_user_email)
+        current_access_level = st.session_state.user_access_level if st.session_state.user_logged_in else None
+        all_documents = get_document_library(user_email=current_user_email, user_access_level=current_access_level)
         
         if not all_documents:
-            st.info("📭 No documents found. Upload documents below or ask admin to add documents.")
+            if st.session_state.user_access_level == "Free":
+                st.info("📭 **Document Library** is available for **Advance** and **Premium** users. Upgrade to access admin-uploaded documents and upload your own.")
+            else:
+                st.info("📭 No documents found. Upload documents below or ask admin to add documents.")
         else:
             # Initialize selected documents in session state
             if "document_selections" not in st.session_state:
@@ -3477,33 +3535,43 @@ elif page == "📄 Upload Reviewer":
                     with col3:
                         st.markdown(f'<span style="background: {source_color}; color: white; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.8rem;">{doc["source"]}</span>', unsafe_allow_html=True)
                     with col4:
-                        # Show download status and button based on permissions
-                        if doc['source'] == "Admin" and doc.get('is_premium_only') and st.session_state.user_access_level != "Premium":
-                            st.markdown("🔒 Premium")
-                        elif doc['source'] == "Admin" and not doc.get('is_downloadable', True):
-                            st.markdown("👁️ Preview Only", help="This file is preview-only and cannot be downloaded")
-                        else:
-                            # Check if user owns the file or if it's downloadable
-                            can_download = True
-                            if doc['source'] == "Admin":
-                                can_download = doc.get('is_downloadable', True)
-                            elif doc['source'] == "Uploaded":
-                                # Users can always download their own files
-                                can_download = True
-                            
-                            if can_download and os.path.exists(doc_path):
+                        # Admin docs: download only for Premium; Advance can view/use but not download
+                        if doc['source'] == "Admin":
+                            can_download_admin = (
+                                st.session_state.user_access_level == "Premium"
+                                and doc.get('is_downloadable', True)
+                            )
+                            if not can_download_admin:
+                                if st.session_state.user_access_level == "Advance":
+                                    st.markdown("👁️ View only", help="Advance users can view and use; download is Premium only")
+                                else:
+                                    st.markdown("🔒 Premium", help="Upgrade to Premium to download")
+                            elif os.path.exists(doc_path):
                                 with open(doc_path, "rb") as f:
                                     file_data = f.read()
+                                    dl_key = f"dl_{unique_doc_key}"
                                     st.download_button(
                                         "📥",
                                         data=file_data,
                                         file_name=doc['filename'],
                                         mime="application/pdf" if doc['type'] == "PDF" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                        key=f"dl_{doc_path}",
+                                        key=dl_key,
                                         help="Download this file"
                                     )
-                            elif doc['source'] == "Admin":
-                                st.markdown("👁️ Preview Only")
+                        else:
+                            # User-uploaded: owner can always download
+                            if os.path.exists(doc_path):
+                                with open(doc_path, "rb") as f:
+                                    file_data = f.read()
+                                    dl_key = f"dl_{unique_doc_key}"
+                                    st.download_button(
+                                        "📥",
+                                        data=file_data,
+                                        file_name=doc['filename'],
+                                        mime="application/pdf" if doc['type'] == "PDF" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                        key=dl_key,
+                                        help="Download this file"
+                                    )
             
             st.markdown("---")
             
@@ -4006,7 +4074,8 @@ elif page == "🧠 Practice Exam":
                     selected_paths = []
                     if "document_selections" in st.session_state:
                         current_user_email = st.session_state.user_email if st.session_state.user_logged_in else None
-                        all_docs = get_document_library(user_email=current_user_email)
+                        current_access_level = st.session_state.user_access_level if st.session_state.user_logged_in else None
+                        all_docs = get_document_library(user_email=current_user_email, user_access_level=current_access_level)
                         selected_paths = [doc['filepath'] for doc in all_docs if st.session_state.document_selections.get(doc['filepath'], False)]
                     
                     # CRITICAL: For Advance/Premium, require document selection - NO dummy questions
