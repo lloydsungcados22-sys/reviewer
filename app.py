@@ -593,9 +593,20 @@ def init_snowflake_tables():
                 created_at VARCHAR(50),
                 last_login VARCHAR(50),
                 premium_code_used VARCHAR(255),
-                is_admin INTEGER DEFAULT 0
+                is_admin INTEGER DEFAULT 0,
+                last_ip VARCHAR(45)
             )
         """)
+        
+        # Migration: add last_ip to users if table existed without it
+        try:
+            user_cols = get_table_columns("users")
+            if user_cols and "last_ip" not in [c.lower() for c in user_cols]:
+                cursor.execute(f"ALTER TABLE {get_table_name('users')} ADD COLUMN last_ip VARCHAR(45)")
+                if is_snowflake():
+                    db_conn.commit()
+        except Exception as _:
+            pass  # Column may already exist or DB doesn't support ALTER
         
         # PDF management table
         cursor.execute(f"""
@@ -2601,10 +2612,21 @@ def use_premium_code(code: str, session_id: str):
 # USER AUTHENTICATION & MANAGEMENT
 # ============================================================================
 
+def get_client_ip() -> Optional[str]:
+    """Get client IP address from request context (Streamlit). Returns None if unavailable (e.g. localhost)."""
+    try:
+        if hasattr(st, "context") and hasattr(st.context, "ip_address"):
+            ip = st.context.ip_address
+            return ip if ip else None
+    except Exception:
+        pass
+    return None
+
 def login_user(email: str) -> Tuple[bool, Dict]:
-    """Login user by email, create if doesn't exist"""
+    """Login user by email, create if doesn't exist. Tracks last login and client IP."""
     table_name = get_table_name("users")
     email = email.strip().lower()
+    client_ip = get_client_ip()
     
     # Check if user exists
     cursor = execute_query(f"""
@@ -2617,12 +2639,21 @@ def login_user(email: str) -> Tuple[bool, Dict]:
     cursor.close()
     
     if result:
-        # User exists, update last login
-        cursor = execute_query(f"""
-            UPDATE {table_name}
-            SET last_login = %s
-            WHERE email = %s
-        """, (datetime.now().isoformat(), email))
+        # User exists, update last login and last IP
+        user_cols = get_table_columns("users")
+        has_last_ip = user_cols and "last_ip" in [c.lower() for c in user_cols]
+        if has_last_ip and client_ip:
+            cursor = execute_query(f"""
+                UPDATE {table_name}
+                SET last_login = %s, last_ip = %s
+                WHERE email = %s
+            """, (datetime.now().isoformat(), client_ip, email))
+        else:
+            cursor = execute_query(f"""
+                UPDATE {table_name}
+                SET last_login = %s
+                WHERE email = %s
+            """, (datetime.now().isoformat(), email))
         cursor.close()
         
         if is_snowflake():
@@ -2637,10 +2668,18 @@ def login_user(email: str) -> Tuple[bool, Dict]:
         }
     else:
         # Create new user with Free access
-        cursor = execute_query(f"""
-            INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (email, "Free", 0, datetime.now().isoformat(), datetime.now().isoformat(), 0))
+        user_cols = get_table_columns("users")
+        has_last_ip = user_cols and "last_ip" in [c.lower() for c in user_cols]
+        if has_last_ip:
+            cursor = execute_query(f"""
+                INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin, last_ip)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (email, "Free", 0, datetime.now().isoformat(), datetime.now().isoformat(), 0, client_ip or ""))
+        else:
+            cursor = execute_query(f"""
+                INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (email, "Free", 0, datetime.now().isoformat(), datetime.now().isoformat(), 0))
         cursor.close()
         
         if is_snowflake():
@@ -3219,17 +3258,27 @@ def render_badge(text: str, color: str):
 @st.cache_data(ttl=120)  # Cache for 2 minutes
 @st.cache_data(ttl=300)
 def get_all_users_cached():
-    """Get all users for admin panel (cached)"""
+    """Get all users for admin panel (cached). Includes last_ip when column exists."""
     table_name = get_table_name("users")
-    cursor = execute_query(f"""
-        SELECT email, access_level, questions_answered, created_at, last_login, premium_code_used, is_admin
-        FROM {table_name}
-        ORDER BY created_at DESC
-    """)
+    user_cols = get_table_columns("users")
+    has_last_ip = user_cols and "last_ip" in [c.lower() for c in user_cols]
+    if has_last_ip:
+        cursor = execute_query(f"""
+            SELECT email, access_level, questions_answered, created_at, last_login, premium_code_used, is_admin, last_ip
+            FROM {table_name}
+            ORDER BY created_at DESC
+        """)
+    else:
+        cursor = execute_query(f"""
+            SELECT email, access_level, questions_answered, created_at, last_login, premium_code_used, is_admin
+            FROM {table_name}
+            ORDER BY created_at DESC
+        """)
     results = cursor.fetchall()
     cursor.close()
-    return [
-        {
+    out = []
+    for r in results:
+        row = {
             "email": r[0],
             "access_level": r[1],
             "questions_answered": r[2],
@@ -3238,8 +3287,12 @@ def get_all_users_cached():
             "premium_code_used": r[5] if len(r) > 5 else None,
             "is_admin": bool(r[6]) if len(r) > 6 else False
         }
-        for r in results
-    ]
+        if has_last_ip and len(r) > 7:
+            row["last_ip"] = r[7] or ""
+        else:
+            row["last_ip"] = ""
+        out.append(row)
+    return out
 
 # Inject theme
 inject_pnp_theme_css()
@@ -3368,6 +3421,7 @@ if page == "🏠 Home":
                         st.session_state.premium_code_used = user_info.get("premium_code_used")
                         if user_info.get("is_admin"):
                             st.session_state.admin_logged_in = True
+                        st.session_state.show_credential_warning = True  # Show warning on next page load
                         
                         st.success(f"✅ Welcome, {user_info['email']}! Access Level: {user_info['access_level']}")
                         st.rerun()
@@ -3384,6 +3438,16 @@ if page == "🏠 Home":
         st.session_state.user_access_level = user_info["access_level"]
         st.session_state.questions_answered = user_info["questions_answered"]
         st.session_state.premium_active = (user_info["access_level"] == "Premium")
+    
+    # Show credential-sharing warning once after login
+    if st.session_state.get("show_credential_warning"):
+        st.warning("""
+        **⚠️ Keep your account secure**  
+        **Do not share your email or login credentials with anyone.**  
+        Access is tied to your account. Sharing credentials can lead to your access being blocked or restricted.  
+        Use only your own account from your own device.
+        """)
+        st.session_state.show_credential_warning = False
     
     # User profile card
     if st.session_state.user_access_level == "Premium":
@@ -5164,11 +5228,19 @@ elif page == "🛠️ Admin Panel":
                         if cursor.fetchone():
                             st.error(f"❌ User with email {new_user_email} already exists.")
                         else:
-                            # Create new user
-                            cursor = execute_query(f"""
-                                INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin)
-                                VALUES (%s, %s, %s, %s, %s, %s)
-                            """, (new_user_email.lower(), new_user_access, 0, datetime.now().isoformat(), datetime.now().isoformat(), 0))
+                            # Create new user (include last_ip if column exists)
+                            user_cols = get_table_columns("users")
+                            has_last_ip = user_cols and "last_ip" in [c.lower() for c in user_cols]
+                            if has_last_ip:
+                                cursor = execute_query(f"""
+                                    INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin, last_ip)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                """, (new_user_email.lower(), new_user_access, 0, datetime.now().isoformat(), datetime.now().isoformat(), 0, ""))
+                            else:
+                                cursor = execute_query(f"""
+                                    INSERT INTO {table_name} (email, access_level, questions_answered, created_at, last_login, is_admin)
+                                    VALUES (%s, %s, %s, %s, %s, %s)
+                                """, (new_user_email.lower(), new_user_access, 0, datetime.now().isoformat(), datetime.now().isoformat(), 0))
                             cursor.close()
                             if is_snowflake():
                                 db_conn.commit()
@@ -5189,7 +5261,7 @@ elif page == "🛠️ Admin Panel":
         
         if users_data:
             st.markdown("#### 📊 All Users")
-            # Build DataFrame from dict keys, then use friendly column titles
+            # Build DataFrame from dict keys, then use friendly column titles (includes Last IP)
             df = pd.DataFrame(users_data)
             df = df.rename(columns={
                 "email": "Email",
@@ -5197,7 +5269,14 @@ elif page == "🛠️ Admin Panel":
                 "questions_answered": "Questions Answered",
                 "created_at": "Created At",
                 "last_login": "Last Login",
+                "last_ip": "Last IP",
             })
+            # Ensure Last IP column is visible (reorder so it appears after Last Login)
+            if "Last IP" in df.columns:
+                cols = [c for c in df.columns if c != "Last IP"]
+                idx = cols.index("Last Login") + 1 if "Last Login" in cols else len(cols)
+                cols.insert(idx, "Last IP")
+                df = df[[c for c in cols if c in df.columns]]
             
             # Search
             search_email = st.text_input("🔍 Search User by Email", placeholder="Enter email to search")
