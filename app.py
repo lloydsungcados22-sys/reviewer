@@ -261,6 +261,15 @@ def extract_text(uploaded_file) -> str:
         # python-docx cannot reliably read legacy .doc files
         return ""
 
+    # ---- Images (OCR) ----
+    if ext in ('.png', '.jpg', '.jpeg'):
+        try:
+            uploaded_file.seek(0)
+            text, _ = extract_text_from_image(uploaded_file)
+            return text or ""
+        except Exception:
+            return ""
+
     # ---- PDF ----
     if ext == ".pdf":
         # Try pypdf first (fast, pure Python)
@@ -995,6 +1004,85 @@ def extract_text_from_docx_with_ocr(docx_file_path: str, filename: str) -> Tuple
     except Exception as e:
         import traceback
         print(f"[ERROR] Error in OCR extraction from Word {filename}: {e}")
+        print(traceback.format_exc())
+        return "", filename
+
+# Supported document and image extensions (documents for library + question generation)
+DOC_EXTENSIONS = ('.pdf', '.docx', '.doc')
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg')
+ALL_DOC_AND_IMAGE_EXTENSIONS = DOC_EXTENSIONS + IMAGE_EXTENSIONS
+
+def extract_text_from_image(image_file, progress_callback=None) -> Tuple[str, str]:
+    """
+    Extract text from image file (PNG, JPG, JPEG) using OCR.
+    Uses EasyOCR first, then Tesseract fallback. Returns (text, filename).
+    """
+    filename = "unknown.png"
+    try:
+        if not OCR_AVAILABLE:
+            if progress_callback:
+                progress_callback("⚠ OCR not available for image files")
+            return "", filename
+
+        # Resolve path or bytes
+        if isinstance(image_file, str):
+            if not os.path.exists(image_file):
+                return "", os.path.basename(image_file)
+            filename = os.path.basename(image_file)
+            try:
+                img = Image.open(image_file)
+            except Exception as e:
+                print(f"[WARNING] Cannot open image {filename}: {e}")
+                return "", filename
+        else:
+            # File-like object (uploaded file)
+            filename = getattr(image_file, 'name', 'unknown.png') or 'unknown.png'
+            try:
+                image_file.seek(0)
+                img = Image.open(io.BytesIO(image_file.read()))
+            except Exception as e:
+                print(f"[WARNING] Cannot open image {filename}: {e}")
+                return "", filename
+
+        # Convert to RGB if necessary (e.g. RGBA, P mode)
+        if img.mode not in ('RGB', 'L'):
+            img = img.convert('RGB')
+        import numpy as np
+        img_array = np.array(img)
+
+        ocr_text = ""
+        # Try EasyOCR first (better for scanned documents and varied fonts)
+        if EASYOCR_AVAILABLE:
+            if progress_callback:
+                progress_callback(f"🔍 Reading image with OCR: {filename}...")
+            reader = get_easyocr_reader(progress_callback=progress_callback)
+            if reader:
+                try:
+                    results = reader.readtext(img_array, paragraph=True, detail=0)
+                    if results:
+                        ocr_text = "\n".join(results).strip()
+                        if progress_callback and ocr_text:
+                            progress_callback(f"✓ Extracted {len(ocr_text)} chars from {filename}")
+                except Exception as e:
+                    print(f"[WARNING] EasyOCR failed for {filename}: {e}")
+
+        # Fallback to Tesseract
+        if not ocr_text and TESSERACT_AVAILABLE:
+            if progress_callback:
+                progress_callback(f"🔍 Trying Tesseract OCR on {filename}...")
+            try:
+                ocr_text = pytesseract.image_to_string(img, config='--psm 6').strip()
+                if ocr_text and progress_callback:
+                    progress_callback(f"✓ Extracted {len(ocr_text)} chars from {filename}")
+            except Exception as e:
+                print(f"[WARNING] Tesseract failed for {filename}: {e}")
+
+        if ocr_text:
+            print(f"[OK] OCR extracted {len(ocr_text)} characters from {filename}")
+        return ocr_text, filename
+    except Exception as e:
+        import traceback
+        print(f"[ERROR] extract_text_from_image {filename}: {e}")
         print(traceback.format_exc())
         return "", filename
 
@@ -2034,7 +2122,7 @@ def get_document_library(user_email: Optional[str] = None, user_access_level: Op
             return dir_docs
         try:
             for filename in os.listdir(directory):
-                if filename.lower().endswith(('.pdf', '.docx', '.doc')):
+                if filename.lower().endswith(ALL_DOC_AND_IMAGE_EXTENSIONS):
                     filepath = os.path.join(directory, filename)
                     try:
                         # Check if file belongs to the user (email in filename or check database)
@@ -2095,7 +2183,7 @@ def get_document_library(user_email: Optional[str] = None, user_access_level: Op
                             "date": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d"),
                             "size": file_size,
                             "size_mb": round(file_size / (1024 * 1024), 2),
-                            "type": "PDF" if filename.lower().endswith('.pdf') else "Word",
+                            "type": _doc_type_from_filename(filename),
                             "is_downloadable": is_downloadable,
                             "is_premium_only": is_premium_only if source == "Admin" else False
                         })
@@ -2104,6 +2192,33 @@ def get_document_library(user_email: Optional[str] = None, user_access_level: Op
         except (OSError, PermissionError):
             pass  # Skip directories that can't be accessed
         return dir_docs
+
+def _doc_type_from_filename(filename: str) -> str:
+    """Return display type: PDF, Word, or Image from filename."""
+    if not filename:
+        return "Document"
+    low = filename.lower()
+    if low.endswith('.pdf'):
+        return "PDF"
+    if low.endswith(('.docx', '.doc')):
+        return "Word"
+    if low.endswith(IMAGE_EXTENSIONS):
+        return "Image"
+    return "Document"
+
+def _mime_for_doc(doc: dict) -> str:
+    """Return MIME type for document download from doc dict (type + filename)."""
+    t = doc.get("type", "Document")
+    if t == "PDF":
+        return "application/pdf"
+    if t == "Word":
+        return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    if t == "Image":
+        fn = (doc.get("filename") or "").lower()
+        if fn.endswith(".png"):
+            return "image/png"
+        return "image/jpeg"
+    return "application/octet-stream"
     
     # 1. Admin-managed PDFs — always include for Advance and Premium (existing and new users)
     # Identify admin docs by uploader: uploaded_by = admin user (is_admin=1) or literal "admin"
@@ -2162,7 +2277,7 @@ def get_document_library(user_email: Optional[str] = None, user_access_level: Op
                 doc_filename = (row[1] or "").strip()
                 is_downloadable = bool(row[2]) if len(row) > 2 and has_dl_col else True
                 is_premium_only = bool(row[3]) if len(row) > 3 and has_premium_col else False
-                if not doc_filename or not doc_filename.lower().endswith(('.pdf', '.docx', '.doc')):
+                if not doc_filename or not doc_filename.lower().endswith(ALL_DOC_AND_IMAGE_EXTENSIONS):
                     continue
                 # Resolve path: stored path may be from another machine; try current app's admin_docs
                 resolved_path = doc_path
@@ -2182,7 +2297,7 @@ def get_document_library(user_email: Optional[str] = None, user_access_level: Op
                             "date": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d"),
                             "size": file_size,
                             "size_mb": round(file_size / (1024 * 1024), 2),
-                            "type": "PDF" if doc_filename.lower().endswith('.pdf') else "Word",
+                            "type": _doc_type_from_filename(doc_filename),
                             "is_downloadable": is_downloadable,
                             "is_premium_only": is_premium_only
                         })
@@ -2222,7 +2337,7 @@ def get_document_library(user_email: Optional[str] = None, user_access_level: Op
                         "date": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d"),
                         "size": file_size,
                         "size_mb": round(file_size / (1024 * 1024), 2),
-                        "type": "PDF" if doc_filename.lower().endswith('.pdf') else "Word"
+                        "type": _doc_type_from_filename(doc_filename)
                     })
                 except (OSError, ValueError):
                     continue
@@ -2232,7 +2347,7 @@ def get_document_library(user_email: Optional[str] = None, user_access_level: Op
         if os.path.exists(UPLOADS_DIR):
             try:
                 for filename in os.listdir(UPLOADS_DIR):
-                    if filename.lower().endswith(('.pdf', '.docx', '.doc')):
+                    if filename.lower().endswith(ALL_DOC_AND_IMAGE_EXTENSIONS):
                         # Check if filename contains user email pattern
                         if user_email_clean in filename.lower():
                             filepath = os.path.join(UPLOADS_DIR, filename)
@@ -2247,7 +2362,7 @@ def get_document_library(user_email: Optional[str] = None, user_access_level: Op
                                         "date": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d"),
                                         "size": file_size,
                                         "size_mb": round(file_size / (1024 * 1024), 2),
-                                        "type": "PDF" if filename.lower().endswith('.pdf') else "Word"
+                                        "type": _doc_type_from_filename(filename)
                                     })
                                 except (OSError, ValueError):
                                     continue
@@ -2362,6 +2477,19 @@ def extract_text_from_documents(document_paths: List[str], max_pages_per_doc: in
                 else:
                     if progress_callback:
                         progress_callback(f"⚠ Word library not available for {os.path.basename(doc_path)}")
+            elif doc_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+                # Image files: extract text via OCR
+                if progress_callback:
+                    progress_callback(f"🔍 Reading image with OCR: {os.path.basename(doc_path)}...")
+                text, _ = extract_text_from_image(doc_path, progress_callback=progress_callback)
+                if text and text.strip():
+                    combined_text.append(text)
+                    total_chars += len(text)
+                    if progress_callback:
+                        progress_callback(f"✓ OCR extracted {len(text)} chars from {os.path.basename(doc_path)}")
+                else:
+                    if progress_callback:
+                        progress_callback(f"⚠ No text found in image {os.path.basename(doc_path)} (OCR returned empty)")
         except Exception as e:
             error_msg = f"Error processing {os.path.basename(doc_path)}: {str(e)}"
             if progress_callback:
@@ -3710,7 +3838,7 @@ elif page == "📄 Upload Reviewer":
                                         "📥",
                                         data=file_data,
                                         file_name=doc['filename'],
-                                        mime="application/pdf" if doc['type'] == "PDF" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                        mime=_mime_for_doc(doc),
                                         key=dl_key,
                                         help="Download this file"
                                     )
@@ -3724,7 +3852,7 @@ elif page == "📄 Upload Reviewer":
                                         "📥",
                                         data=file_data,
                                         file_name=doc['filename'],
-                                        mime="application/pdf" if doc['type'] == "PDF" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                        mime=_mime_for_doc(doc),
                                         key=dl_key,
                                         help="Download this file"
                                     )
@@ -3811,6 +3939,12 @@ elif page == "📄 Upload Reviewer":
                                                 if ocr_text and ocr_text.strip():
                                                     ocr_texts.append(ocr_text)
                                                     st.info(f"✓ OCR extracted {len(ocr_text)} chars from {os.path.basename(doc_path)}")
+                                            elif doc_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+                                                update_preview_progress(f"Reading image with OCR: {os.path.basename(doc_path)}...")
+                                                ocr_text, _ = extract_text_from_image(doc_path)
+                                                if ocr_text and ocr_text.strip():
+                                                    ocr_texts.append(ocr_text)
+                                                    st.info(f"✓ OCR extracted {len(ocr_text)} chars from {os.path.basename(doc_path)}")
                                         except Exception as doc_error:
                                             st.warning(f"⚠ OCR failed for {os.path.basename(doc_path)}: {str(doc_error)}")
                                     
@@ -3874,13 +4008,13 @@ elif page == "📄 Upload Reviewer":
                 <p style="color: #d4af37; margin: 1rem 0 0 0; font-weight: 600;">Go to <strong>💳 Payment</strong> page to upgrade!</p>
             </div>
             """, unsafe_allow_html=True)
-            st.file_uploader("Choose PDF or Word document", type=["pdf", "docx", "doc"], disabled=True, help="Upgrade to Advance or Premium to unlock document upload")
+            st.file_uploader("Choose document or image", type=["pdf", "docx", "doc", "png", "jpg", "jpeg"], disabled=True, help="Upgrade to Advance or Premium to unlock document upload")
             uploaded_file = None  # No file upload for Free users
         else:
             uploaded_file = st.file_uploader(
-                "Choose PDF or Word document",
-                type=["pdf", "docx", "doc"],
-                help="Upload your criminology reviewer PDF or Word document",
+                "Choose PDF, Word, or image (PNG/JPG)",
+                type=["pdf", "docx", "doc", "png", "jpg", "jpeg"],
+                help="Upload reviewer PDF, Word doc, or images (text in images is read via OCR for question generation)",
                 key=f"user_upload_{st.session_state.user_email or 'guest'}",
             )
 
@@ -3999,6 +4133,17 @@ elif page == "📄 Upload Reviewer":
                                 if not text or not text.strip():
                                     try:
                                         text, name = extract_text_from_docx(file_path)
+                                    except Exception:
+                                        pass
+
+                            elif file_ext in ["png", "jpg", "jpeg"]:
+                                # Images: extract text via OCR (file path is more reliable after save)
+                                with st.spinner("🔍 Reading image with OCR... This may take a moment."):
+                                    try:
+                                        text, name = extract_text_from_image(file_path)
+                                        if not text and uploaded_file:
+                                            uploaded_file.seek(0)
+                                            text, name = extract_text_from_image(uploaded_file)
                                     except Exception:
                                         pass
 
@@ -4292,8 +4437,13 @@ elif page == "🧠 Practice Exam":
                                         try:
                                             if doc_path.lower().endswith('.pdf'):
                                                 update_progress(f"🔍 Running OCR on {os.path.basename(doc_path)}...")
-                                                # Force OCR attempt
                                                 ocr_text, _ = extract_text_from_pdf(doc_path)
+                                                if ocr_text and ocr_text.strip():
+                                                    ocr_texts.append(ocr_text)
+                                                    update_progress(f"✓ OCR extracted {len(ocr_text)} chars from {os.path.basename(doc_path)}")
+                                            elif doc_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+                                                update_progress(f"🔍 Reading image with OCR: {os.path.basename(doc_path)}...")
+                                                ocr_text, _ = extract_text_from_image(doc_path)
                                                 if ocr_text and ocr_text.strip():
                                                     ocr_texts.append(ocr_text)
                                                     update_progress(f"✓ OCR extracted {len(ocr_text)} chars from {os.path.basename(doc_path)}")
@@ -4384,6 +4534,15 @@ elif page == "🧠 Practice Exam":
                                                         st.write(f"  - Word extraction test: ⚠ No text extracted")
                                                 else:
                                                     st.write(f"  - Word extraction test: ✗ Word library not available")
+                                            elif doc_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+                                                if OCR_AVAILABLE:
+                                                    test_text, _ = extract_text_from_image(doc_path)
+                                                    if test_text:
+                                                        st.write(f"  - Image OCR test: ✓ Success ({len(test_text)} chars)")
+                                                    else:
+                                                        st.write(f"  - Image OCR test: ⚠ No text extracted")
+                                                else:
+                                                    st.write(f"  - Image OCR test: ✗ OCR not available")
                                         except Exception as e:
                                             st.write(f"  - Extraction test error: {str(e)[:100]}")
                             
@@ -5210,7 +5369,7 @@ elif page == "🛠️ Admin Panel":
         # Upload new PDF
         st.markdown("#### 📤 Upload New PDF")
         with st.form("upload_pdf_admin_tab4"):
-            uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf", "docx", "doc"], key="admin_pdf_upload_tab4")
+            uploaded_pdf = st.file_uploader("Upload PDF, Word, or image", type=["pdf", "docx", "doc", "png", "jpg", "jpeg"], key="admin_pdf_upload_tab4")
             is_premium_only = st.checkbox("Premium Only", value=False, help="Only Premium users can download this PDF")
             use_for_ai = st.checkbox("Use for AI Question Generation", value=True, help="Include this PDF in AI question generation")
             is_downloadable = st.checkbox("Allow Download", value=True, help="✅ Downloadable: Users can download this file | ❌ Preview-only: Users can only preview, not download")
