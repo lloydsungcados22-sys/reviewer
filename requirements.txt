@@ -15,6 +15,7 @@ Pypdf>=4.0.0
 # OCR support (lightweight)
 pytesseract>=0.3.10
 opencv-python-headless>=4.8.0
+easyocr>=1.7.0
 
 # Database
 snowflake-connector-python>=3.0.0
@@ -23,4 +24,5 @@ snowflake-connector-python>=3.0.0
 # torch>=2.0.0,<2.2.0
 # torchvision>=0.15.0,<0.17.0
 # easyocr>=1.7.0
+
 
