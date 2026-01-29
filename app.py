@@ -2106,40 +2106,68 @@ def get_document_library(user_email: Optional[str] = None, user_access_level: Op
         return dir_docs
     
     # 1. Admin-managed PDFs — always include for Advance and Premium (existing and new users)
+    # Use pdf_resources as source of truth (shared DB) and resolve path to current app's admin_docs
     if user_access_level in ("Advance", "Premium"):
         os.makedirs(ADMIN_DOCS_DIR, exist_ok=True)
-        admin_from_scan = scan_directory(ADMIN_DOCS_DIR, "Admin")
-        documents.extend(admin_from_scan)
-        # Fallback: also include admin docs from pdf_resources (in case path differs or scan missed any)
+        admin_paths_seen = set()
+        
+        # Primary: load admin docs from pdf_resources (filepath contains admin_docs)
         try:
             table_name = get_table_name("pdf_resources")
-            cursor = execute_query(f"""
-                SELECT filepath, filename FROM {table_name}
-                WHERE filepath LIKE %s OR filepath LIKE %s
-            """, (f"%{os.path.basename(ADMIN_DOCS_DIR.rstrip(os.sep))}%", "%admin_docs%"))
+            cols = get_table_columns("pdf_resources")
+            has_dl_col = cols and "is_downloadable" in [c.lower() for c in cols]
+            has_premium_col = cols and "is_premium_only" in [c.lower() for c in cols]
+            if has_dl_col and has_premium_col:
+                cursor = execute_query(f"""
+                    SELECT filepath, filename, is_downloadable, is_premium_only FROM {table_name}
+                    WHERE filepath LIKE %s OR filepath LIKE %s
+                """, (f"%{os.path.basename(ADMIN_DOCS_DIR.rstrip(os.sep))}%", "%admin_docs%"))
+            else:
+                cursor = execute_query(f"""
+                    SELECT filepath, filename FROM {table_name}
+                    WHERE filepath LIKE %s OR filepath LIKE %s
+                """, (f"%{os.path.basename(ADMIN_DOCS_DIR.rstrip(os.sep))}%", "%admin_docs%"))
             admin_rows = cursor.fetchall()
             cursor.close()
-            existing_paths = {d["filepath"] for d in documents}
-            for doc_path, doc_filename in admin_rows:
-                if doc_path not in existing_paths and os.path.exists(doc_path) and doc_filename.lower().endswith(('.pdf', '.docx', '.doc')):
+            for row in admin_rows:
+                doc_path = row[0]
+                doc_filename = row[1]
+                is_downloadable = bool(row[2]) if len(row) > 2 and has_dl_col else True
+                is_premium_only = bool(row[3]) if len(row) > 3 and has_premium_col else False
+                if not doc_filename or not doc_filename.lower().endswith(('.pdf', '.docx', '.doc')):
+                    continue
+                # Resolve path: stored path may be from another machine; try current app's admin_docs
+                resolved_path = doc_path
+                if not os.path.exists(resolved_path):
+                    resolved_path = os.path.join(ADMIN_DOCS_DIR, os.path.basename(doc_path))
+                if not os.path.exists(resolved_path):
+                    resolved_path = os.path.join(ADMIN_DOCS_DIR, doc_filename)
+                if os.path.exists(resolved_path) and resolved_path not in admin_paths_seen:
+                    admin_paths_seen.add(resolved_path)
                     try:
-                        file_size = os.path.getsize(doc_path)
-                        mtime = os.path.getmtime(doc_path)
+                        file_size = os.path.getsize(resolved_path)
+                        mtime = os.path.getmtime(resolved_path)
                         documents.append({
                             "filename": doc_filename,
-                            "filepath": doc_path,
+                            "filepath": resolved_path,
                             "source": "Admin",
                             "date": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d"),
                             "size": file_size,
                             "size_mb": round(file_size / (1024 * 1024), 2),
                             "type": "PDF" if doc_filename.lower().endswith('.pdf') else "Word",
-                            "is_downloadable": True,
-                            "is_premium_only": False
+                            "is_downloadable": is_downloadable,
+                            "is_premium_only": is_premium_only
                         })
                     except (OSError, ValueError):
                         continue
         except Exception:
             pass
+        
+        # Also scan admin_docs folder for any files not already in list (e.g. uploaded but not in DB yet)
+        admin_from_scan = scan_directory(ADMIN_DOCS_DIR, "Admin")
+        for d in admin_from_scan:
+            if d["filepath"] not in admin_paths_seen:
+                documents.append(d)
     
     # 2. User-uploaded PDFs from /uploads/ (filtered by user email)
     if user_email:
@@ -3565,6 +3593,9 @@ elif page == "📄 Upload Reviewer":
         # Get documents: all admin-uploaded docs for Advance/Premium; user docs by email
         current_user_email = st.session_state.user_email if st.session_state.user_logged_in else None
         current_access_level = st.session_state.user_access_level if st.session_state.user_logged_in else None
+        # Clear cache for Advance/Premium so admin docs from DB are always fresh when opening this page
+        if current_access_level in ("Advance", "Premium"):
+            get_document_library.clear()
         all_documents = get_document_library(user_email=current_user_email, user_access_level=current_access_level)
         
         if not all_documents:
