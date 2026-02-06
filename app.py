@@ -3543,7 +3543,7 @@ with st.sidebar:
     else:
         page = st.radio(
             "Select Page",
-            ["🏠 Home", "📄 Upload Reviewer", "🧠 Practice Exam", "💳 Payment", "🛠️ Admin Panel"],
+            ["🏠 Home","🧠 Practice Exam","📄 Upload Reviewer", "💳 Payment", "🛠️ Admin Panel"],
             label_visibility="collapsed"
         )
     
