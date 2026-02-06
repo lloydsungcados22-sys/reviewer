@@ -3593,8 +3593,8 @@ with st.sidebar:
 if st.session_state.user_logged_in:
     nav_pages = [
         ("🏠", "Home", "🏠 Home"),
-        ("📄", "Upload Reviewer", "📄 Upload Reviewer"),
         ("🧠", "Practice Exam", "🧠 Practice Exam"),
+        ("📄", "Upload Reviewer", "📄 Upload Reviewer"),
         ("💳", "Payment", "💳 Payment"),
     ]
     if st.session_state.get("admin_logged_in"):
@@ -5607,4 +5607,5 @@ st.markdown("""
     <p>© 2024 PH Criminology Exam Reviewer</p>
 </div>
 """, unsafe_allow_html=True)
+
 
