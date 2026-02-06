@@ -3543,7 +3543,7 @@ with st.sidebar:
     else:
         page = st.radio(
             "Select Page",
-            ["🏠 Home", "📄 Upload Reviewer", "🧠 Practice Exam", "💳 Payment", "🛠️ Admin Panel"],
+            ["🏠 Home", "🧠 Practice Exam", "📄 Upload Reviewer", "💳 Payment", "🛠️ Admin Panel"],
             label_visibility="collapsed"
         )
     
@@ -5607,3 +5607,4 @@ st.markdown("""
     <p>© 2024 PH Criminology Exam Reviewer</p>
 </div>
 """, unsafe_allow_html=True)
+
